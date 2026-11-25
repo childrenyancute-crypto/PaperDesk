@@ -1,6 +1,6 @@
 # PaperDesk
 
-[English quick start](../README.md) · [下载示例 PDF](../examples/reading-sample.pdf)
+[English quick start](../README.md) · [下载示例 PDF](../examples/reading-sample.pdf) · [提交试用反馈](https://github.com/childrenyancute-crypto/PaperDesk/issues/new?template=beta-feedback.yml)
 
 PaperDesk 是为理论物理和数学文献准备的 Mac 阅读器。你可以把几页里的公式放进同一个问题，回看保存的回答时点出处跳回原文。PDF 阅读、批注、笔记和导出都能单独使用。
 
@@ -15,7 +15,7 @@ cd PaperDesk
 open dist/PaperDesk.app
 ```
 
-如需放进 Finder 的「应用程序」，可在配置 AI 连接前移动 `dist/PaperDesk.app`。如果构建或阅读时遇到问题，可在 [GitHub Issues](https://github.com/childrenyancute-crypto/PaperDesk/issues) 附上 Mac 型号、macOS 版本和可复现的步骤。能公开分享的示例 PDF 也有帮助。
+如需放进 Finder 的「应用程序」，可在配置 AI 连接前移动 `dist/PaperDesk.app`。
 
 ## 用示例做一次跨页问答
 
@@ -28,6 +28,8 @@ open dist/PaperDesk.app
 如果想试回答里的编号出处，可把这份合成示例的「AI 正文读取范围」调为「全文」，请客户端在答复中引用两页的相关段落。
 
 如果暂时不接 AI，也可以点「焦点」中任一选区旁的批注按钮，写一条批注，然后通过「更多 → 导出批注 PDF」带走。
+
+试完后欢迎留一句话，说说哪一步帮到了你，或者你在哪一步卡住。安装没成功也可以提交。[提交试用反馈](https://github.com/childrenyancute-crypto/PaperDesk/issues/new?template=beta-feedback.yml)
 
 ## 阅读、批注与笔记
 

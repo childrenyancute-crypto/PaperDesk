@@ -1,6 +1,6 @@
 # PaperDesk
 
-[中文使用说明](docs/usage.zh-CN.md) · [Example PDF](examples/reading-sample.pdf) · [Releases](https://github.com/childrenyancute-crypto/PaperDesk/releases)
+[中文使用说明](docs/usage.zh-CN.md) · [Example PDF](examples/reading-sample.pdf) · [Releases](https://github.com/childrenyancute-crypto/PaperDesk/releases) · [Beta feedback](https://github.com/childrenyancute-crypto/PaperDesk/issues/new?template=beta-feedback.yml)
 
 PaperDesk is a macOS PDF reader for formula-heavy papers in physics and mathematics. Select passages and box equations across pages, ask about them in your AI client, and jump from a saved answer back to the relevant passage.
 
@@ -35,11 +35,13 @@ For a client you configure manually, open **More → Connect MCP client** and co
 
 Open the discussion in **Reading** and click one of the selection labels beneath the question to jump back to the original spot. To try numbered citations inside the answer, set **AI text scope** to **Full text** for this synthetic sample and ask the client to cite the two pages. If PaperDesk shows no connection, check that the client is running from the paper's project folder and has loaded the local MCP connection.
 
+After trying PaperDesk, tell us which step helped or where you got stuck. A sentence is enough to start. [Share beta feedback](https://github.com/childrenyancute-crypto/PaperDesk/issues/new?template=beta-feedback.yml)
+
 ## Data and compatibility
 
 - The library is stored in `~/Library/Application Support/PaperDesk/Library`. **More** includes annotated PDF export, Markdown and JSON exports, and a library backup.
 - Your AI client can send the content it reads, including selected equation images, to its model provider. Handwritten notes have a separate sharing switch and start private.
-- This beta was exercised on Apple Silicon. **Report a problem** through [GitHub Issues](https://github.com/childrenyancute-crypto/PaperDesk/issues) with your Mac model, macOS version, and steps to reproduce. A synthetic or freely shareable PDF is helpful for reader issues.
+- This beta was exercised on Apple Silicon.
 
 ## Development and license
 

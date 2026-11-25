@@ -1,0 +1,55 @@
+name: Beta feedback / 试用反馈
+description: Tell us what you tried, what helped, and where you got stuck. / 告诉我们你试了什么、哪里有用、哪里卡住。
+title: "[Feedback] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A sentence is enough. For a PDF issue, try the [example PDF](https://github.com/childrenyancute-crypto/PaperDesk/releases/download/v0.7.4/reading-sample.pdf) or a file you can share publicly.
+
+        留一句话就可以。遇到 PDF 问题时，可以用[示例 PDF](https://github.com/childrenyancute-crypto/PaperDesk/releases/download/v0.7.4/reading-sample.pdf)或其他可以公开分享的文件复现。
+
+        Feedback is public. / 反馈会公开显示。
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: What did you try? / 你试用了哪一部分？
+      options:
+        - Installation or build / 安装或构建
+        - PDF reading or selections / PDF 阅读或选区
+        - Notes or annotations / 笔记或批注
+        - AI or MCP setup / AI 或 MCP 连接
+        - Sources or citations / 出处或引用
+        - Other / 其他
+    validations:
+      required: false
+
+  - type: textarea
+    id: experience
+    attributes:
+      label: What happened? / 使用情况
+      description: What did you try, where did you get stuck, or which step felt useful? / 你试了什么、在哪一步卡住，或者哪一步最有用？
+      placeholder: |
+        After boxing the equations on two pages, I…
+        框选两页上的公式后，我……
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Optional setup details / 可选的环境信息
+      description: Mac model, macOS version, build method, and AI client if relevant. / 如相关，可填写 Mac 型号、macOS 版本、构建方式和 AI 客户端。
+      placeholder: |
+        MacBook Air M2, macOS 15, built with ./scripts/package-app.sh, Codex
+    validations:
+      required: false
+
+  - type: textarea
+    id: next
+    attributes:
+      label: What should improve next? / 你最希望下一步改进什么？
+      description: A small wish or example is enough. / 写一个小愿望或例子就可以。
+    validations:
+      required: false
