@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "lsp": {
+    "sourcekit-lsp": { "command": ["sourcekit-lsp"] },
+    "astro": { "disabled": true },
+    "bash": { "disabled": true },
+    "clangd": { "disabled": true },
+    "kotlin-ls": { "disabled": true },
+    "lua-ls": { "disabled": true },
+    "php intelephense": { "disabled": true },
+    "svelte": { "disabled": true },
+    "terraform": { "disabled": true },
+    "tinymist": { "disabled": true },
+    "vue": { "disabled": true },
+    "yaml-ls": { "disabled": true }
+  }
+}
