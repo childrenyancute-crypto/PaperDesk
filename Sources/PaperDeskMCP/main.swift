@@ -7,7 +7,7 @@ private let version = "0.3.0"
 private let readBufferSize = 64 * 1024
 
 private func printUsage() {
-    let usage = "paperdesk-mcp (\(version))\nUsage: paperdesk-mcp [--library PATH] [--paper-id ID --document-hash HASH] [--client-label LABEL]\n\nConnects an AI client to one PaperDesk literature project over a local socket.\n"
+    let usage = "paperdesk-mcp (\(version))\nUsage: paperdesk-mcp [--library PATH] [--paper-id ID --document-hash HASH] [--client-label LABEL] [--check-connection]\n\nConnects an AI client to one PaperDesk literature project over a local socket.\n"
     FileHandle.standardOutput.write(Data(usage.utf8))
 }
 
@@ -88,6 +88,13 @@ var pending = Data()
 var discardingOversizedFrame = false
 var clientName: String? = commandLineClientLabel
 var clientVersion: String?
+// A bound helper is not a live MCP connection until the peer has completed a
+// successful initialize request. In particular, tools/list and a stray
+// notifications/initialized notification must not make a pre-handshake
+// process appear in PaperDesk's connection list. A successful initialize is
+// sufficient even when a client omits clientInfo.name; the app can still
+// identify that confirmed process by its PID.
+private var completedInitialize = false
 // A connection ID is the fallback for a new chat. A follow-up can identify
 // its previous archived answer to continue the same chat after a reconnect.
 let conversationID = "mcp-" + UUID().uuidString
@@ -107,7 +114,7 @@ private func sendHeartbeat(_ context: HeartbeatContext, method: String) {
 }
 
 private func startHeartbeatIfNeeded() {
-    guard heartbeatContext == nil, let boundPaperID else { return }
+    guard completedInitialize, heartbeatContext == nil, let boundPaperID else { return }
     var heartbeatArguments: [String: JSONValue] = [:]
     heartbeatArguments["_bound_paper_id"] = .string(boundPaperID)
     if let boundDocumentHash { heartbeatArguments["_bound_document_hash"] = .string(boundDocumentHash) }
@@ -145,6 +152,17 @@ func invokeReader(_ method: String, _ requestArguments: JSONValue) throws -> JSO
     if let questionRequestID { object["_question_request"] = .string(questionRequestID) }
     else { object.removeValue(forKey: "_question_request") }
     return try client.call(method: method, arguments: .object(object))
+}
+
+if arguments.contains("--check-connection") {
+    do {
+        let status = try invokeReader(MCPProtocol.connectionStatusTool, .object([:]))
+        writeStdout(status)
+        exit(EXIT_SUCCESS)
+    } catch {
+        FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
+        exit(EXIT_FAILURE)
+    }
 }
 
 // check_latex is pure computation over the reply text and does not need the
@@ -225,10 +243,11 @@ let processLine: (Data) -> Void = { lineData in
                    !discoveredVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     clientVersion = discoveredVersion
                 }
-                startHeartbeatIfNeeded()
+                completedInitialize = true
             }
         }
         if boundPaperID != nil, !boundProjectContactSent,
+           completedInitialize,
            initializeSucceeded || method == "notifications/initialized",
            let contact = try? invokeReader("__mcp_client_connected", .object([:])),
            contact["isError"].boolValue != true {

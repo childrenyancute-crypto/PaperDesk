@@ -39,18 +39,7 @@ struct ConnectionConfigurationSheet: View {
                 .font(InspectorText.detail)
                 .foregroundStyle(.secondary)
 
-            VStack(alignment: .leading, spacing: 6) {
-                Picker(L("AI 正文读取范围"), selection: $model.scope) {
-                    ForEach(ContextScope.allCases, id: \.self) { value in
-                        Text(L(value.title)).tag(value)
-                    }
-                }
-                .disabled(model.selectedPaper == nil)
-                Text(L("新文献默认仅共享已固定的选区；需要更多上下文时可改为当前页或全文。",
-                       "New papers share pinned selections by default. Choose the current page or full text when more context is needed."))
-                    .font(InspectorText.detail)
-                    .foregroundStyle(.secondary)
-            }
+            ConnectionPolicyControls(model: model, bindToPaper: form.boundToCurrentPaper)
 
             if let configurationError = form.configurationError {
                 Label(configurationError, systemImage: "exclamationmark.triangle")
@@ -150,5 +139,80 @@ private final class ConnectionConfigurationSheetState: ObservableObject {
     @Published var launchCommand = ""
     @Published var launchArguments = ""
     @Published var configurationError: String?
+}
+
+struct ConnectionPolicyControls: View {
+    @ObservedObject var model: AppModel
+    var bindToPaper = true
+    @StateObject private var check = ConnectionCheckState()
+
+    private var clientNames: [String] {
+        guard let paper = model.selectedPaper else { return [] }
+        return Array(Set(model.connectedClients(forPaperID: paper.id).map(\.displayName))).sorted()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(L("允许 AI 标记 PDF 原文", "Allow AI to highlight PDF sources"), isOn: $model.allowsAICitationMarks)
+            Text(L("允许已连接的客户端为回答生成原文高亮。高亮随回答显示。", "Connected clients can create source highlights that appear with an answer."))
+                .font(InspectorText.detail)
+                .foregroundStyle(.secondary)
+            Picker(L("AI 正文读取范围"), selection: $model.scope) {
+                ForEach(ContextScope.allCases, id: \.self) { value in
+                    Text(L(value.title)).tag(value)
+                }
+            }
+            .disabled(model.selectedPaper == nil)
+            Divider()
+            HStack {
+                if clientNames.isEmpty {
+                    Label(L("当前论文暂无已连接的客户端", "No clients are connected to this paper"), systemImage: "circle")
+                } else {
+                    Label(clientNames.joined(separator: " · "), systemImage: "checkmark.circle")
+                }
+                Spacer()
+                Button(L("本机连接自检", "Check local connection")) { checkConnection() }
+                    .disabled(check.result == .checking)
+            }
+            .font(InspectorText.detail)
+            switch check.result {
+            case .idle:
+                EmptyView()
+            case .checking:
+                ProgressView().controlSize(.small)
+            case .passed:
+                Label(L("PaperDesk 本机连接正常。", "PaperDesk's local connection passed."), systemImage: "checkmark.circle")
+                    .font(InspectorText.detail)
+                    .foregroundStyle(.secondary)
+            case .failed(let message):
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .font(InspectorText.detail)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func checkConnection() {
+        check.result = .checking
+        Task {
+            do {
+                let launch = try model.mcpLaunchConfiguration(
+                    bound: bindToPaper && model.selectedPaper != nil, clientLabel: "")
+                _ = try await model.checkMCPConnection(launch: launch)
+                model.refreshMCPConnectionState()
+                check.result = .passed
+            } catch {
+                check.result = .failed(error.localizedDescription)
+            }
+        }
+    }
+}
+
+private final class ConnectionCheckState: ObservableObject {
+    enum Result: Equatable {
+        case idle, checking, passed, failed(String)
+    }
+
+    @Published var result: Result = .idle
 }
 

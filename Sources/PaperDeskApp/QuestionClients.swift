@@ -20,7 +20,8 @@ protocol QuestionClientAdapter: Sendable {
     func isValidSessionID(_ id: String) -> Bool
 
     func send(project: URL, sessionID: String?, prompt: String,
-              connector: String, connectorArguments: [String]) async throws -> ExternalQuestionAnswer
+              connector: String, connectorArguments: [String],
+              onProgress: @escaping @Sendable (QuestionClientEvent) async -> Void) async throws -> ExternalQuestionAnswer
     func conversationTitles(sessionIDs: [String], project: URL) async -> [String: String]
 
     /// Writes this harness's MCP configuration into the paper project so the
@@ -30,6 +31,14 @@ protocol QuestionClientAdapter: Sendable {
 
 extension QuestionClientAdapter {
     func isAvailable() -> Bool { executableURL() != nil }
+
+    /// Compatibility overload for callers that do not need live milestones.
+    func send(project: URL, sessionID: String?, prompt: String,
+              connector: String, connectorArguments: [String]) async throws -> ExternalQuestionAnswer {
+        try await send(project: project, sessionID: sessionID, prompt: prompt,
+                       connector: connector, connectorArguments: connectorArguments,
+                       onProgress: { _ in })
+    }
 }
 
 enum QuestionClientRegistry {
@@ -108,7 +117,8 @@ struct CodexQuestionAdapter: QuestionClientAdapter {
     }
 
     func send(project: URL, sessionID: String?, prompt: String,
-              connector: String, connectorArguments: [String]) async throws -> ExternalQuestionAnswer {
+              connector: String, connectorArguments: [String],
+              onProgress: @escaping @Sendable (QuestionClientEvent) async -> Void = { _ in }) async throws -> ExternalQuestionAnswer {
         try Task.checkCancellation()
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { throw ExternalQuestionRunnerError.emptyPrompt }
@@ -135,6 +145,23 @@ struct CodexQuestionAdapter: QuestionClientAdapter {
             arguments += ["-c", "mcp_servers.paperdesk.command=\(tomlString(command))"]
             arguments += ["-c", "mcp_servers.paperdesk.args=\(tomlArray(mcp.arguments))"]
         }
+        // These tools are authorized for this PaperDesk question. The reader
+        // still checks the current scope and citation permission at each call.
+        let isPaperBoundQuestion = connectorArguments.contains("--question-request")
+            && connectorArguments.contains("--paper-id")
+            && connectorArguments.contains("--document-hash")
+        if isPaperBoundQuestion {
+            for tool in MCPProtocol.readingWorkflowWriteTools {
+                arguments += ["-c", "mcp_servers.paperdesk.tools.\(tool).approval_mode=\"approve\""]
+            }
+        }
+        let isPaperBoundTask = connectorArguments.contains("--paper-id")
+            && connectorArguments.contains("--document-hash")
+        if isPaperBoundTask {
+            for tool in MCPProtocol.paperBoundWriteTools + ["capture_reading_state"] {
+                arguments += ["-c", "mcp_servers.paperdesk.tools.\(tool).approval_mode=\"approve\""]
+            }
+        }
         if let effectiveSessionID { arguments.append(effectiveSessionID) }
         // Codex documents `-` as the stdin prompt.
         arguments.append("-")
@@ -142,7 +169,8 @@ struct CodexQuestionAdapter: QuestionClientAdapter {
         let output = try await ExternalQuestionRunner.runProcess(
             executable: executable, arguments: arguments,
             environment: ProcessInfo.processInfo.environment,
-            standardInput: trimmedPrompt, project: projectURL)
+            standardInput: trimmedPrompt, project: projectURL,
+            progressFromLine: { line in CodexQuestionAdapter.progressEvent(from: line) }, onProgress: onProgress)
         let parsed = parse(output.stdout)
         guard let answer = parsed.answer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty,
               let reported = parsed.sessionID, !reported.isEmpty else {
@@ -155,6 +183,14 @@ struct CodexQuestionAdapter: QuestionClientAdapter {
         guard isValidSessionID(sessionID) else { throw ExternalQuestionRunnerError.invalidResponse }
         let title = await conversationTitles(sessionIDs: [sessionID], project: projectURL)[sessionID]
         return ExternalQuestionAnswer(sessionID: sessionID, answer: answer, conversationTitle: title)
+    }
+
+    private static func progressEvent(from line: Data) -> QuestionClientEvent? {
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+        let type = (object["type"] as? String)?.lowercased() ?? ""
+        if type == "thread.started" || type == "thread_started" { return .connected }
+        if type == "turn.started" || type == "turn_started" { return .generatingAnswer }
+        return nil
     }
 
     func conversationTitles(sessionIDs: [String], project: URL) async -> [String: String] {
@@ -213,11 +249,15 @@ struct CodexQuestionAdapter: QuestionClientAdapter {
             let permissions = tools.map { "[mcp_servers.paperdesk.tools.\($0)]\napproval_mode = \"approve\"" }
             return ([connection] + permissions).joined(separator: "\n\n") + "\n"
         }
-        let server = serverConfig(allowed: previousTools + ["set_reading_goal", "submit_note_draft"])
+        let previousServer = serverConfig(allowed: previousTools + ["set_reading_goal", "submit_note_draft"])
+        let readOnlyReferenceServer = serverConfig(allowed: MCPProtocol.readingWorkflowWriteTools + ["save_extractive_summary", "set_reading_goal", "submit_note_draft"])
+        let server = serverConfig(allowed: MCPProtocol.readingWorkflowWriteTools + MCPProtocol.paperBoundWriteTools + ["save_extractive_summary", "set_reading_goal", "submit_note_draft"])
         let legacyServer = serverConfig(allowed: legacyTools + ["submit_note_draft"])
         let configURL = configuration.appendingPathComponent("config.toml")
         let oldConfig = try? String(contentsOf: configURL, encoding: .utf8)
-        if !FileManager.default.fileExists(atPath: configURL.path) || oldConfig == connection || oldConfig == legacyServer {
+        if !FileManager.default.fileExists(atPath: configURL.path)
+            || oldConfig == connection || oldConfig == previousServer
+            || oldConfig == readOnlyReferenceServer || oldConfig == legacyServer {
             try server.write(to: configURL, atomically: true, encoding: .utf8)
         }
     }
@@ -313,7 +353,8 @@ struct OpenCodeQuestionAdapter: QuestionClientAdapter {
     }
 
     func send(project: URL, sessionID: String?, prompt: String,
-              connector: String, connectorArguments: [String]) async throws -> ExternalQuestionAnswer {
+              connector: String, connectorArguments: [String],
+              onProgress: @escaping @Sendable (QuestionClientEvent) async -> Void = { _ in }) async throws -> ExternalQuestionAnswer {
         try Task.checkCancellation()
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { throw ExternalQuestionRunnerError.emptyPrompt }
@@ -333,7 +374,8 @@ struct OpenCodeQuestionAdapter: QuestionClientAdapter {
         let output = try await ExternalQuestionRunner.runProcess(
             executable: executable, arguments: arguments,
             environment: opencodeEnvironment(mcp: mcp),
-            standardInput: trimmedPrompt, project: projectURL)
+            standardInput: trimmedPrompt, project: projectURL,
+            progressFromLine: { line in OpenCodeQuestionAdapter.progressEvent(from: line) }, onProgress: onProgress)
         let parsed = parse(output.stdout)
         guard let answer = parsed.answer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty,
               let reported = parsed.sessionID, isValidSessionID(reported) else {
@@ -342,8 +384,14 @@ struct OpenCodeQuestionAdapter: QuestionClientAdapter {
         if let effectiveSessionID, reported != effectiveSessionID {
             throw ExternalQuestionRunnerError.sessionMismatch
         }
-        let title = await conversationTitles(sessionIDs: [reported], project: projectURL)[reported]
-        return ExternalQuestionAnswer(sessionID: reported, answer: answer, conversationTitle: title)
+        return ExternalQuestionAnswer(sessionID: reported, answer: answer)
+    }
+
+    private static func progressEvent(from line: Data) -> QuestionClientEvent? {
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+        let type = (object["type"] as? String)?.lowercased() ?? ""
+        if type == "step_start" || type == "step.start" { return .generatingAnswer }
+        return nil
     }
 
     func conversationTitles(sessionIDs: [String], project: URL) async -> [String: String] {

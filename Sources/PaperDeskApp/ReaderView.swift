@@ -184,6 +184,14 @@ public struct ReaderView: View {
                         }
                     }
                     Toggle(L("允许 AI 读取手写笔记"), isOn: $model.shareNotesWithAI)
+                    Toggle(L("允许 AI 标记 PDF 原文", "Allow AI to highlight PDF sources"), isOn: $model.allowsAICitationMarks)
+                    Toggle(L("连接 AI 时自动核实参考文献", "Verify references automatically when an AI client is connected"), isOn: $model.autoVerifyReferences)
+                    Button {
+                        model.reindexReferences()
+                    } label: {
+                        Label(L("重建参考文献索引", "Rebuild reference index"), systemImage: "book.closed")
+                    }
+                    .disabled(model.selectedPaper == nil || model.referenceIndexingPaperIDs.contains(model.selectedPaper?.id ?? ""))
                     Divider()
                     Picker(L("界面语言"), selection: $language) {
                         ForEach(AppLanguage.allCases) { value in
@@ -721,6 +729,18 @@ enum InspectorText {
     static let detailStrong = serif(13, bold: true)
     static let badge = serif(10, bold: true)
     static let title = serif(17, bold: true)
+    static let bodyNSFont = serifNS(16)
+    static let badgeNSFont = serifNS(10, bold: true)
+
+    static func serifNS(_ size: CGFloat, bold: Bool = false) -> NSFont {
+        let cascade = NSFontDescriptor(name: bold ? "STSongti-SC-Bold" : "STSongti-SC-Regular", size: size)
+        let attributes: [NSFontDescriptor.AttributeName: Any] = [
+            .name: bold ? "Georgia-Bold" : "Georgia",
+            .cascadeList: [cascade]
+        ]
+        return NSFont(descriptor: NSFontDescriptor(fontAttributes: attributes), size: size)
+            ?? .systemFont(ofSize: size)
+    }
 
     private static func serif(_ size: CGFloat, bold: Bool = false) -> Font {
         // Request Songti before the default CJK fallback for mixed lines.
@@ -763,7 +783,7 @@ private struct ReaderInspector: View {
             case 0:
                 SelectionPanel(model: model, onEditGoal: onEditGoal, onShowNotes: onShowNotes, onAddManualAnnotation: onAddManualAnnotation)
             default:
-                ReadingPanel(model: model, noteDraft: $noteDraft, editingNoteID: $editingNoteID, selectedNote: selectedNote)
+                ReadingPanel(model: model, questions: model.questions, noteDraft: $noteDraft, editingNoteID: $editingNoteID, selectedNote: selectedNote)
             }
         }
         .font(InspectorText.body)
@@ -1191,6 +1211,7 @@ private final class ReadingPanelState: ObservableObject {
 
 private struct ReadingPanel: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var questions: PaperQuestions
     @Binding var noteDraft: String
     @Binding var editingNoteID: String?
     let selectedNote: ReadingNote?
@@ -1234,17 +1255,41 @@ private struct ReadingPanel: View {
     var body: some View {
         let sourcesByNote = summarySourcesByNoteID
         let conversations = ConversationGrouping.group(discussionMessages)
+        let codexBindings = codexBindingsByConversationID
         VStack(spacing: 0) {
-            if pendingNoteCount > 0 {
-                pendingDraftReview(sourcesByNote: sourcesByNote)
-                if let selectedNote {
-                    Divider()
-                    noteEditor(selectedNote, sourcesByNote: sourcesByNote)
-                        .frame(maxHeight: 330)
+            if let paperID = model.selectedPaper?.id, let progress = questions.progressByPaperID[paperID] {
+                PaperQuestionProgressStatus(progress: progress) {
+                    questions.cancel(paperID: paperID)
                 }
+                .padding(10)
+                Divider()
+            } else if let activeProgressError, !activeProgressError.isEmpty {
+                Label(activeProgressError, systemImage: "exclamationmark.triangle")
+                    .font(InspectorText.detail)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
                 Divider()
             }
-            conversationList(conversations)
+            if let conversation = conversations.first(where: { $0.id == form.expandedConversationID }) {
+                conversationDetail(conversation, codexBinding: codexBindings[conversation.stableConversationID])
+            } else {
+                if let feedbackCounts {
+                    ReadingFeedbackSummary(counts: feedbackCounts)
+                    Divider()
+                }
+                if pendingNoteCount > 0 {
+                    pendingDraftReview(sourcesByNote: sourcesByNote)
+                    if let selectedNote {
+                        Divider()
+                        noteEditor(selectedNote, sourcesByNote: sourcesByNote)
+                            .frame(maxHeight: 330)
+                    }
+                    Divider()
+                }
+                conversationList(conversations)
+            }
         }
         .onAppear {
             loadExcerptEditor()
@@ -1253,10 +1298,37 @@ private struct ReadingPanel: View {
         .onChange(of: editingNoteID) { _, _ in loadExcerptEditor() }
         .onChange(of: model.notes) { _, _ in loadExcerptEditor() }
         .onChange(of: model.activeReadingConversationID) { _, _ in syncActiveConversation() }
+        .onChange(of: model.selectedPaper?.id) { _, _ in syncActiveConversation() }
     }
 
     private var pendingNoteCount: Int {
         pendingAnnotationNotes.count + pendingExcerptNotes.count + pendingOrdinaryNotes.count
+    }
+
+    private var feedbackCounts: ReadingFeedbackCounts? {
+        var counts = ReadingFeedbackCounts()
+        for message in discussionMessages where message.role == .user {
+            guard let feedback = message.readingFeedback else { continue }
+            switch feedback.kind {
+            case .unclear:
+                counts.unclear += 1
+            case .repeatedQuestion:
+                counts.repeatedQuestion += 1
+            case .followUp:
+                counts.followUp += 1
+            }
+        }
+        return counts.total == 0 ? nil : counts
+    }
+
+    private var codexBindingsByConversationID: [String: QuestionBinding] {
+        guard let paperID = model.selectedPaper?.id,
+              let bindings = try? model.store.questionBindings(paperID: paperID) else { return [:] }
+        var result: [String: QuestionBinding] = [:]
+        for binding in bindings where binding.backend.caseInsensitiveCompare("codex") == .orderedSame {
+            result[binding.conversationID] = binding
+        }
+        return result
     }
 
     private func pendingDraftReview(sourcesByNote: [String: [ExtractiveSource]]) -> some View {
@@ -1355,93 +1427,170 @@ private struct ReadingPanel: View {
     }
 
     private func conversationRow(_ conversation: ConversationSummary) -> some View {
-        let expanded = form.expandedConversationID == conversation.id
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 6) {
+        Button {
+            openConversation(conversation)
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 3)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(conversation.title)
+                        .font(InspectorText.section)
+                        .lineLimit(2)
+                        .help(conversation.title)
+                    HStack(spacing: 6) {
+                        sourceBadge(L(conversation.sourceLabel), color: conversationColor(conversation))
+                        Text(L("\(conversation.turnCount) 轮", "\(conversation.turnCount) turns"))
+                        Text(Self.shortDateFormatter.string(from: conversation.updatedAt))
+                    }
+                    .font(InspectorText.detail)
+                    .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(ReaderPalette.surface, in: RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(ReaderPalette.divider.opacity(0.9), lineWidth: 0.5)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func conversationDetail(_ conversation: ConversationSummary,
+                                    codexBinding: QuestionBinding?) -> some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 8) {
                 Button {
-                    toggleConversation(conversation, expanded: expanded)
+                    closeConversationDetail()
                 } label: {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 12)
-                        .padding(.top, 3)
+                    Label(L("返回阅读", "Back to Reading"), systemImage: "chevron.left")
                 }
                 .buttonStyle(.borderless)
-                .help(expanded ? L("收起对话") : L("展开对话"))
-                VStack(alignment: .leading, spacing: 4) {
-                    conversationTitleView(conversation)
+                .help(L("返回阅读记录", "Back to reading records"))
+
+                Divider()
+                    .frame(height: 22)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    conversationTitleView(conversation, codexBinding: codexBinding)
                     HStack(spacing: 6) {
                         sourceBadge(L(conversation.sourceLabel), color: conversationColor(conversation))
                         Text(L("\(conversation.turnCount) 轮", "\(conversation.turnCount) turns"))
                             .font(InspectorText.detail)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.secondary)
                         Text(Self.shortDateFormatter.string(from: conversation.updatedAt))
                             .font(InspectorText.detail)
                             .foregroundStyle(.tertiary)
-                        Spacer(minLength: 0)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if expanded {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(conversation.messages.enumerated()), id: \.element.id) { index, message in
-                        if index > 0 {
-                            Rectangle()
-                                .fill(ReaderPalette.divider.opacity(0.55))
-                                .frame(height: 1)
-                                .padding(.vertical, 10)
-                                .padding(.leading, 2)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+            Divider()
+
+            ScrollViewReader { scroll in
+                ScrollView(.vertical) {
+                    // A plain stack keeps the reply heights fixed before the
+                    // initial scroll-to-answer, so opening a conversation does
+                    // not bounce while lazy rows materialize.
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(conversation.messages.enumerated()), id: \.element.id) { index, message in
+                            VStack(alignment: .leading, spacing: 0) {
+                                if index > 0 {
+                                    Rectangle()
+                                        .fill(ReaderPalette.divider.opacity(0.55))
+                                        .frame(height: 1)
+                                        .padding(.vertical, 12)
+                                }
+                                DiscussionTurn(message: message,
+                                               conversationID: conversation.id,
+                                               model: model,
+                                               expandedMessageIDs: $form.expandedMessageIDs)
+                            }
+                            .id(message.id)
                         }
-                        DiscussionTurn(message: message, conversationID: conversation.id, model: model, expandedMessageIDs: $form.expandedMessageIDs)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                }
+                .task(id: conversation.id) {
+                    if let answer = conversation.messages.last(where: { $0.role == .assistant }) {
+                        scroll.scrollTo(answer.id, anchor: .top)
                     }
                 }
-                .padding(.top, 8)
-                .padding(.leading, 18)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .padding(10)
-        .background(ReaderPalette.surface, in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(ReaderPalette.divider.opacity(0.9), lineWidth: 0.5)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(ReaderPalette.inspector)
+    }
+
+    private func openConversation(_ conversation: ConversationSummary) {
+        withAnimation(.easeInOut(duration: 0.12)) {
+            form.expandedConversationID = conversation.id
+            model.activeReadingConversationID = conversation.id
+            selectDefaultMessage(in: conversation)
         }
     }
 
-    private func toggleConversation(_ conversation: ConversationSummary, expanded: Bool) {
+    private func closeConversationDetail() {
         withAnimation(.easeInOut(duration: 0.12)) {
-            if expanded {
-                form.expandedConversationID = nil
-                if model.activeReadingConversationID == conversation.id {
-                    model.activeReadingConversationID = nil
-                }
-                if let active = model.activeCitationMessageID,
-                   conversation.messages.contains(where: { $0.id == active }) {
-                    model.clearCitationMarks()
-                }
-            } else {
-                form.expandedConversationID = conversation.id
-                model.activeReadingConversationID = conversation.id
-                if let answer = conversation.messages.last(where: { $0.role == .assistant }),
-                   let citations = answer.citations, !citations.isEmpty {
-                    model.activateCitations(for: answer)
-                } else if let active = model.activeCitationMessageID,
-                          !conversation.messages.contains(where: { $0.id == active }) {
-                    model.clearCitationMarks()
-                }
+            form.expandedConversationID = nil
+            form.expandedMessageIDs.removeAll()
+            if model.activeReadingConversationID != nil {
+                model.activeReadingConversationID = nil
             }
+            model.clearCitationMarks()
         }
+    }
+
+    private func selectDefaultMessage(in conversation: ConversationSummary) {
+        guard let answer = conversation.messages.last(where: { $0.role == .assistant }) else {
+            form.expandedMessageIDs.removeAll()
+            model.clearCitationMarks()
+            return
+        }
+        form.expandedMessageIDs = [answer.id]
+        model.activateCitations(for: answer)
     }
 
     @ViewBuilder
-    private func conversationTitleView(_ conversation: ConversationSummary) -> some View {
+    private func conversationTitleView(_ conversation: ConversationSummary,
+                                       codexBinding: QuestionBinding?) -> some View {
         HStack(spacing: 6) {
             Text(conversation.title)
                 .font(InspectorText.section)
                 .lineLimit(2)
                 .help(conversation.title)
             Spacer(minLength: 0)
+            if let url = codexThreadURL(for: codexBinding) {
+                Link(destination: url) {
+                    Label(L("在 Codex 中打开", "Open in Codex"), systemImage: "arrow.up.right.square")
+                        .font(InspectorText.detail)
+                        .foregroundStyle(ReaderPalette.action)
+                }
+                .help(L("在 Codex 中打开这条对话", "Open this conversation in Codex"))
+                .accessibilityLabel(L("在 Codex 中打开", "Open in Codex"))
+            }
         }
+    }
+
+    private func codexThreadURL(for binding: QuestionBinding?) -> URL? {
+        guard let binding,
+              binding.backend.caseInsensitiveCompare("codex") == .orderedSame,
+              let threadID = UUID(uuidString: binding.externalSessionID.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return nil
+        }
+        return URL(string: "codex://threads/\(threadID.uuidString.lowercased())")
     }
 
     private func sourceBadge(_ label: String, color: Color) -> some View {
@@ -1585,14 +1734,22 @@ private struct ReadingPanel: View {
         model.discussion
     }
 
+    private var activeProgressError: String? {
+        guard let paperID = model.selectedPaper?.id else { return nil }
+        return questions.errors[paperID]
+    }
+
     private func syncActiveConversation() {
-        guard let conversationID = model.activeReadingConversationID else {
+        guard let conversationID = model.activeReadingConversationID,
+              let conversation = ConversationGrouping.group(discussionMessages).first(where: { $0.id == conversationID }) else {
             form.expandedConversationID = nil
+            form.expandedMessageIDs.removeAll()
+            model.clearCitationMarks()
             return
         }
-        guard let conversation = ConversationGrouping.group(discussionMessages)
-                .first(where: { $0.id == conversationID }) else { return }
-        form.expandedConversationID = conversation.id
+        guard form.expandedConversationID != conversationID else { return }
+        form.expandedConversationID = conversationID
+        selectDefaultMessage(in: conversation)
     }
 
     @ViewBuilder
@@ -1607,8 +1764,8 @@ private struct ReadingPanel: View {
                 Spacer()
                 Text(L("第 \(note.pageLabel) 页", "Page \(note.pageLabel)")).font(InspectorText.detail).foregroundStyle(.secondary)
             }
-            LatexText(source: note.content, bodyFont: InspectorText.body)
-                .lineLimit(3)
+            LatexText(source: note.content, bodyFont: InspectorText.bodyNSFont, maxLines: 3,
+                      allowsSelection: false)
                 .foregroundStyle(.primary)
             let ids = (try? model.store.noteContextIDs(noteID: note.id)) ?? []
             if !ids.isEmpty {
@@ -1852,11 +2009,66 @@ private struct ReadingPanel: View {
     }
 }
 
+private struct ReadingFeedbackCounts {
+    var unclear = 0
+    var repeatedQuestion = 0
+    var followUp = 0
+
+    var total: Int { unclear + repeatedQuestion + followUp }
+}
+
+private struct ReadingFeedbackSummary: View {
+    let counts: ReadingFeedbackCounts
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "text.bubble")
+                    .foregroundStyle(ReaderPalette.action)
+                Text(L("阅读反馈", "Reading feedback"))
+                    .font(InspectorText.section)
+                Spacer(minLength: 0)
+                Text(L("共 \(counts.total) 条", "\(counts.total) total"))
+                    .font(InspectorText.detail)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 6) {
+                countChip(label: L("不清楚", "Unclear"), count: counts.unclear, color: ReaderPalette.action)
+                countChip(label: L("重复问题", "Repeated"), count: counts.repeatedQuestion, color: ReaderPalette.focusManual)
+                countChip(label: L("普通追问", "Follow-up"), count: counts.followUp, color: .secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private func countChip(label: String, count: Int, color: Color) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .lineLimit(1)
+            Text("\(count)")
+                .font(InspectorText.detailStrong)
+        }
+        .font(InspectorText.detail)
+        .foregroundStyle(color)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(color.opacity(0.10), in: Capsule())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(L("\(label) \(count) 条", "\(label): \(count)"))
+    }
+}
+
+private final class ReferenceSelectionState: ObservableObject {
+    @Published var referenceID: String?
+}
+
 private struct DiscussionTurn: View {
     let message: PaperChatMessage
     let conversationID: String
     @ObservedObject var model: AppModel
     @Binding var expandedMessageIDs: Set<String>
+    @StateObject private var referenceSelection = ReferenceSelectionState()
 
     private var isAnswer: Bool { message.role == .assistant }
     private var citations: [MessageCitation] { message.citations ?? [] }
@@ -1867,6 +2079,9 @@ private struct DiscussionTurn: View {
         message.text.count > 900 || message.text.components(separatedBy: "\n\n").count > 6
     }
     private var isExpanded: Bool { expandedMessageIDs.contains(message.id) }
+    private var isActiveAnswer: Bool {
+        isAnswer && model.activeCitationMessageID == message.id
+    }
     private var contextIDs: [String] {
         if let ids = message.sourceContextIDs, !ids.isEmpty { return ids }
         if let id = message.contextID { return [id] }
@@ -1877,31 +2092,81 @@ private struct DiscussionTurn: View {
         VStack(alignment: .leading, spacing: 6) {
             header
             content
-            if isLong {
-                Button(isExpanded ? L("收起") : L("展开全文")) {
-                    if isExpanded { expandedMessageIDs.remove(message.id) } else { expandedMessageIDs.insert(message.id) }
-                }
-                .buttonStyle(.borderless)
-                .font(InspectorText.detail)
-                .foregroundStyle(ReaderPalette.action)
-            }
             if !isAnswer && !contextIDs.isEmpty {
                 sourceChips
+            }
+            if !isAnswer, message.readingFeedback != nil {
+                feedbackChip
             }
             if isAnswer && !citations.isEmpty {
                 citationChips
             }
-        }
-        .padding(8)
-        .background(isAnswer ? Color.clear : ReaderPalette.softAction, in: RoundedRectangle(cornerRadius: 7))
-        .overlay(alignment: .leading) {
-            if isAnswer {
-                Rectangle()
-                    .fill(ReaderPalette.citation.opacity(0.4))
-                    .frame(width: 2)
-                    .padding(.vertical, 2)
+            if isAnswer, let warnings = message.citationWarnings, !warnings.isEmpty {
+                citationWarning(warnings)
+            }
+            if isAnswer || isLong {
+                expansionControl
             }
         }
+        .padding(8)
+        .background(cardBackground, in: RoundedRectangle(cornerRadius: 7))
+        .overlay {
+            if isAnswer {
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(isActiveAnswer ? ReaderPalette.citation : ReaderPalette.divider.opacity(0.55),
+                            lineWidth: isActiveAnswer ? 2 : 1)
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 7))
+        .onTapGesture {
+            if isAnswer { activateAnswer() }
+        }
+        .popover(isPresented: Binding(
+            get: { referenceSelection.referenceID != nil },
+            set: { if !$0 { referenceSelection.referenceID = nil } }
+        ), arrowEdge: .bottom) {
+            if let referenceID = referenceSelection.referenceID {
+                ReferenceCard(model: model, referenceID: referenceID,
+                              archivedReference: message.referencedWorks?.first { $0.referenceID == referenceID })
+            }
+        }
+    }
+
+    private var cardBackground: Color {
+        guard isAnswer else { return ReaderPalette.softAction }
+        return isActiveAnswer ? ReaderPalette.citation.opacity(0.07) : .clear
+    }
+
+    private func toggleExpansion() {
+        if isExpanded {
+            expandedMessageIDs.remove(message.id)
+        } else {
+            expandedMessageIDs.insert(message.id)
+        }
+    }
+
+    private func activateAnswer() {
+        guard isAnswer else { return }
+        model.activeReadingConversationID = conversationID
+        model.activateCitations(for: message)
+    }
+
+    private var expansionControl: some View {
+        Button {
+            toggleExpansion()
+        } label: {
+            HStack(spacing: 3) {
+                Text(isExpanded ? L("收起") : L("展开全文"))
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .font(InspectorText.detail)
+            .foregroundStyle(ReaderPalette.action)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isExpanded ? L("收起这条对话") : L("展开这条对话的全文"))
     }
 
     private var header: some View {
@@ -1916,18 +2181,6 @@ private struct DiscussionTurn: View {
                 .font(InspectorText.detail)
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 0)
-            if isAnswer && !citations.isEmpty {
-                Button(model.activeCitationMessageID == message.id ? L("隐藏标注") : L("正文标注")) {
-                    if model.activeCitationMessageID != message.id {
-                        model.activeReadingConversationID = conversationID
-                    }
-                    model.toggleCitationMarks(for: message)
-                }
-                .buttonStyle(.borderless)
-                .font(InspectorText.detail)
-                .foregroundStyle(ReaderPalette.citation)
-                .help(L("在 PDF 中显示或隐藏这条回答的出处"))
-            }
             if message.manuallyRecorded == true && isAnswer {
                 Button {
                     model.setManualDiscussionSharing(discussionID: message.id, shared: !(message.sharedWithAI ?? false))
@@ -1940,23 +2193,34 @@ private struct DiscussionTurn: View {
                 .foregroundStyle(message.sharedWithAI == true ? ReaderPalette.action : .secondary)
                 .help(message.sharedWithAI == true ? L("点击后停止向 AI 客户端提供这条问答") : L("点击后允许 AI 客户端检索这条问答"))
             }
+            if isActiveAnswer {
+                Image(systemName: "eye.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(ReaderPalette.citation)
+                    .help(L("正文中正在显示这条回答的引用"))
+                    .accessibilityLabel(L("正在浏览这条回答的引用"))
+            }
         }
     }
 
     private var content: some View {
-        LatexText(source: message.text, bodyFont: InspectorText.body,
-                  citationContextIDs: citationMap, citationColor: ReaderPalette.citation)
-            .textSelection(.enabled)
+        LatexText(source: message.text, bodyFont: InspectorText.bodyNSFont,
+                  citationContextIDs: citationMap, citationColor: ReaderPalette.citation,
+                  references: isAnswer ? model.references : [],
+                  referencedWorks: isAnswer ? message.referencedWorks : nil,
+                  showsReferenceLinks: isAnswer,
+                  heightLimit: !isExpanded && (isAnswer || isLong) ? 110 : nil,
+                  onTap: isAnswer ? { activateAnswer() } : nil,
+                  onReference: { referenceSelection.referenceID = $0 })
             .environment(\.openURL, OpenURLAction { url in
                 guard url.scheme == "paperdesk-citation" else { return .systemAction }
                 let contextID = url.host ?? url.path.replacingOccurrences(of: "/", with: "")
                 guard !contextID.isEmpty, let context = try? model.store.context(id: contextID) else { return .handled }
-                model.activeReadingConversationID = conversationID
-                model.activateCitations(for: message)
+                activateAnswer()
                 model.showSelection(context)
                 return .handled
             })
-            .frame(maxHeight: !isExpanded && isLong ? 300 : nil, alignment: .top)
+            .frame(maxHeight: !isExpanded && (isAnswer || isLong) ? 110 : nil, alignment: .top)
             .clipped()
             .overlay(alignment: .bottom) {
                 if !isExpanded && isLong {
@@ -1971,15 +2235,16 @@ private struct DiscussionTurn: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(message.text, forType: .string)
                 }
+                if isAnswer {
+                    Button(L("复制回答和出处", "Copy answer with sources")) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(answerWithSources, forType: .string)
+                    }
+                }
             }
             .padding(.leading, isAnswer ? 8 : 2)
             .contentShape(Rectangle())
-            .simultaneousGesture(TapGesture().onEnded {
-                if isAnswer {
-                    model.activeReadingConversationID = conversationID
-                    if !citations.isEmpty { model.activateCitations(for: message) }
-                }
-            })
+
     }
 
     private var sourceChips: some View {
@@ -2004,6 +2269,70 @@ private struct DiscussionTurn: View {
             }
         }
         .padding(.leading, 2)
+    }
+
+    @ViewBuilder
+    private var feedbackChip: some View {
+        if let display = feedbackDisplay {
+            HStack(spacing: 4) {
+                Image(systemName: display.icon)
+                    .font(.system(size: 10, weight: .semibold))
+                Text(display.label)
+                    .lineLimit(1)
+                if let answerMode = display.answerMode {
+                    Text("·")
+                        .foregroundStyle(display.color.opacity(0.65))
+                    Text(answerMode)
+                        .lineLimit(1)
+                }
+            }
+            .font(InspectorText.detail)
+            .foregroundStyle(display.color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(display.color.opacity(0.10), in: Capsule())
+            .overlay {
+                Capsule().stroke(display.color.opacity(0.24), lineWidth: 0.5)
+            }
+            .help(display.helpText)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(L("阅读反馈：\(display.label)", "Reading feedback: \(display.label)"))
+            .accessibilityHint(display.helpText)
+            .padding(.leading, 2)
+        }
+    }
+
+    private var feedbackDisplay: (label: String, color: Color, icon: String, answerMode: String?, helpText: String)? {
+        guard let feedback = message.readingFeedback else { return nil }
+        let presentation: (label: String, color: Color, icon: String)
+        switch feedback.kind {
+        case .unclear:
+            presentation = (L("不清楚", "Unclear"), ReaderPalette.action, "questionmark")
+        case .repeatedQuestion:
+            presentation = (L("重复问题", "Repeated"), ReaderPalette.focusManual, "arrow.triangle.2.circlepath")
+        case .followUp:
+            presentation = (L("普通追问", "Follow-up"), .secondary, "arrow.turn.down.right")
+        }
+        let answerMode = answerModeLabel(for: feedback.answerID)
+        let evidence = feedback.evidence
+        var helpText = evidence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? presentation.label : evidence
+        if let answerMode {
+            helpText += " · " + L("对应回答：\(answerMode)", "Answer: \(answerMode)")
+        }
+        return (presentation.label, presentation.color, presentation.icon, answerMode, helpText)
+    }
+
+    private func answerModeLabel(for answerID: String) -> String? {
+        guard let answer = model.discussion.first(where: { $0.id == answerID && $0.role == .assistant }),
+              let mode = answer.answerMode else { return nil }
+        switch mode {
+        case .direct:
+            return L("直答", "Direct")
+        case .selfReview:
+            return L("自检", "Self-review")
+        case .independentReview:
+            return L("独立复核", "Independent review")
+        }
     }
 
     private var citationChips: some View {
@@ -2040,10 +2369,49 @@ private struct DiscussionTurn: View {
         .padding(.leading, 8)
     }
 
+    private func citationWarning(_ warnings: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(L("引用需要核对", "Citations need review"), systemImage: "exclamationmark.bubble")
+                .font(InspectorText.detailStrong)
+                .foregroundStyle(ReaderPalette.focusManual)
+            ForEach(Array(warnings.enumerated()), id: \.offset) { item in
+                Text(item.element)
+                    .font(InspectorText.detail)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.leading, 8)
+    }
+
+    private var answerWithSources: String {
+        var sections = [message.text]
+        let sourceLines = citations.compactMap { citation -> String? in
+            guard let context = try? model.store.context(id: citation.contextID) else { return nil }
+            let quote = context.sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let location = L("第 \(context.pageLabel) 页", "page \(context.pageLabel)")
+            return quote.isEmpty ? "⟦\(citation.label)⟧ · \(location)" : "⟦\(citation.label)⟧ · \(location)\n> \(quote)"
+        }
+        if !sourceLines.isEmpty {
+            sections.append(L("原文出处\n" + sourceLines.joined(separator: "\n\n"),
+                              "PDF sources\n" + sourceLines.joined(separator: "\n\n")))
+        }
+        if let works = message.referencedWorks, !works.isEmpty {
+            let lines = works.map { work in
+                let authors = work.authors ?? L("作者未识别", "Author not recognized")
+                let title = work.title ?? L("标题未识别", "Title not recognized")
+                let year = work.year.map(String.init) ?? ""
+                return "[\(work.label)] \(authors). \(title). \(year)."
+            }
+            sections.append(L("参考文献\n" + lines.joined(separator: "\n"),
+                              "Bibliography\n" + lines.joined(separator: "\n")))
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
     private func jump(to citation: MessageCitation) {
         guard let context = try? model.store.context(id: citation.contextID) else { return }
-        model.activeReadingConversationID = conversationID
-        model.activateCitations(for: message)
+        activateAnswer()
         model.showSelection(context)
     }
 
@@ -2078,6 +2446,10 @@ private struct StatusBar: View {
         HStack(spacing: 8) {
             if let selectedPaper = model.selectedPaper {
                 Text(L("第 \(model.currentPageIndex + 1) / \(selectedPaper.pageCount) 页", "Page \(model.currentPageIndex + 1) of \(selectedPaper.pageCount)"))
+            }
+            if !model.referenceIndexingPaperIDs.isEmpty {
+                Text(L("正在整理参考文献…", "Indexing references…"))
+                    .foregroundStyle(.tertiary)
             }
             Spacer()
             if let error = model.errorMessage {

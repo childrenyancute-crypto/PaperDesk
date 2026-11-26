@@ -47,6 +47,9 @@ struct ProjectNamePrompt: Identifiable, Equatable {
 @MainActor
 public final class AppModel: ObservableObject {
     public let store: LibraryStore
+    private let preferences: UserDefaults
+    private static let citationMarksPreferenceKey = "paperdesk.allowAICitationMarks"
+    private static let autoVerifyReferencesPreferenceKey = "paperdesk.autoVerifyReferences"
 
     @Published public private(set) var papers: [Paper] = []
     @Published public private(set) var selectedPaper: Paper?
@@ -56,6 +59,15 @@ public final class AppModel: ObservableObject {
     @Published private(set) var activeSelections: [ReadingSelection] = []
     @Published private(set) var readingGoal = ""
     @Published private(set) var discussion: [PaperChatMessage] = []
+    @Published public private(set) var references: [PaperReference] = []
+    @Published public private(set) var referenceIndex: PaperReferenceIndex?
+    @Published public private(set) var referenceIndexingPaperIDs: Set<String> = []
+    @Published public private(set) var verifyingReferenceIDs: Set<String> = []
+    @Published public private(set) var referenceVerificationRunningPaperIDs: Set<String> = []
+    @Published public private(set) var referenceVerificationErrors: [String: String] = [:]
+    @Published public var autoVerifyReferences: Bool {
+        didSet { preferences.set(autoVerifyReferences, forKey: Self.autoVerifyReferencesPreferenceKey) }
+    }
     @Published var activeReadingConversationID: String?
     let questions = PaperQuestions()
     @Published public private(set) var context: ContextSnapshot?
@@ -63,9 +75,13 @@ public final class AppModel: ObservableObject {
     /// Only one answer is highlighted at a time.
     @Published public private(set) var activeCitationMessageID: String?
     @Published public private(set) var activeCitationMarks: [CitationMark] = []
-    /// New papers start with the narrowest sharing scope. Users can widen it
-    /// from the More menu or the MCP connection sheet for the current paper.
-    @Published public var scope: ContextScope = .selection {
+    @Published var allowsAICitationMarks: Bool {
+        didSet { preferences.set(allowsAICitationMarks, forKey: Self.citationMarksPreferenceKey) }
+    }
+    /// A fresh app launch shares the full paper by default. Users can narrow
+    /// the scope from the More menu or the MCP connection sheet for the
+    /// current paper, and that choice remains active while this app is open.
+    @Published public var scope: ContextScope = .document {
         didSet { if let id = selectedPaper?.id { paperScopes[id] = scope } }
     }
     @Published public var shareNotesWithAI: Bool = false {
@@ -78,6 +94,8 @@ public final class AppModel: ObservableObject {
     private var paperScopes: [String: ContextScope] = [:]
     private var paperNoteSharing: [String: Bool] = [:]
     private var externalTitleRefreshTask: Task<Void, Never>?
+    private var referenceVerificationLastAttempt: [String: Date] = [:]
+    private var referenceBackfillStarted = false
     private var externalTitleRefreshPaperID: String?
     @Published public var bridgeConnected: Bool = false
     @Published var projectNamePrompt: ProjectNamePrompt?
@@ -105,22 +123,31 @@ public final class AppModel: ObservableObject {
     @Published public var errorMessage: String?
     @Published public var statusMessage: String?
 
-    public init(store: LibraryStore) throws {
+    public convenience init(store: LibraryStore) throws {
+        try self.init(store: store, preferences: .standard)
+    }
+
+    init(store: LibraryStore, preferences: UserDefaults) throws {
         self.store = store
+        self.preferences = preferences
+        self.allowsAICitationMarks = preferences.object(forKey: Self.citationMarksPreferenceKey) as? Bool ?? true
+        self.autoVerifyReferences = preferences.object(forKey: Self.autoVerifyReferencesPreferenceKey) as? Bool ?? true
         repairedSelectionImages.totalCostLimit = 8 * 1024 * 1024
         refreshLibrary()
+        startReferenceBackfillIfNeeded()
     }
 
     func recordClientConnection(connectionID: String, paperID: String, documentHash: String?,
                                 clientName: String?, clientVersion: String?, processID: Int32? = nil) {
-        let name = clientName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let displayName = name.isEmpty ? L("未知客户端") : name
-        let clientID = QuestionClientRegistry.adapter(clientName: displayName)?.id
+        let reportedName = clientName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let name = reportedName.isEmpty ? mcpConnections[connectionID]?.clientName ?? "" : reportedName
+        let clientID = QuestionClientRegistry.adapter(clientName: name)?.id
         mcpConnections[connectionID] = MCPClientConnection(
             id: connectionID, paperID: paperID, documentHash: documentHash,
-            clientName: displayName, clientVersion: clientVersion,
+            clientName: name, clientVersion: clientVersion,
             clientID: clientID, processID: processID, lastSeen: Date())
         pruneExpiredConnections()
+        scheduleReferenceVerificationIfNeeded(paperID: paperID)
     }
 
     func removeClientConnection(connectionID: String) {
@@ -157,28 +184,34 @@ public final class AppModel: ObservableObject {
             guard let hash, let bound, bound != hash else { return true }
             return false
         }
+        // A process scan is useful for recovering the client label when an
+        // older helper sent an anonymous heartbeat, but it is not itself a
+        // connection confirmation. In particular, an idle helper left behind
+        // by a test must not become a visible or selectable client merely
+        // because `ps` can still see it.
+        let detectedByPID = Dictionary(uniqueKeysWithValues: detectedMCPProcesses
+            .filter { process in
+                process.paperID == paperID && matchesHash(process.documentHash)
+            }
+            .map { ($0.pid, $0) })
         let heartbeat = mcpConnections.values.filter { connection in
             connection.paperID == paperID && connection.lastSeen >= cutoff && matchesHash(connection.documentHash)
+        }.map { connection in
+            guard connection.clientName.isEmpty, let pid = connection.processID,
+                  let process = detectedByPID[pid], process.documentHash == connection.documentHash,
+                  let clientName = process.clientName,
+                  let clientID = process.clientID else { return connection }
+            // Keep the heartbeat's id, version, timestamp and paper binding;
+            // only fill the missing identity from the matching live helper.
+            return MCPClientConnection(id: connection.id, paperID: connection.paperID,
+                                       documentHash: connection.documentHash,
+                                       clientName: clientName,
+                                       clientVersion: connection.clientVersion,
+                                       clientID: clientID,
+                                       processID: connection.processID,
+                                       lastSeen: connection.lastSeen)
         }
-        let heartbeatProcessIDs = Set(heartbeat.compactMap(\.processID))
-        // Older `paperdesk-mcp` helpers do not send heartbeats yet. A live
-        // helper process bound to this paper is still a real MCP connection.
-        let detected = detectedMCPProcesses.filter { process in
-            process.paperID == paperID && matchesHash(process.documentHash) && !heartbeatProcessIDs.contains(process.pid)
-        }
-        .map { process in
-            MCPClientConnection(id: "process:\(process.pid)", paperID: process.paperID,
-                                documentHash: process.documentHash,
-                                clientName: process.clientName ?? L("未知客户端"),
-                                clientVersion: nil, clientID: process.clientID,
-                                processID: process.pid,
-                                lastSeen: Date())
-        }
-        // Heartbeats from older helpers do not identify their process. Keep
-        // the historical name fallback only for those older records.
-        let heartbeatNames = Set(heartbeat.filter { $0.processID == nil }.map(\.displayName))
-        let extra = detected.filter { !heartbeatNames.contains($0.displayName) }
-        return (heartbeat + extra).sorted { lhs, rhs in
+        return heartbeat.sorted { lhs, rhs in
             if lhs.displayName != rhs.displayName { return lhs.displayName < rhs.displayName }
             return lhs.lastSeen > rhs.lastSeen
         }
@@ -224,6 +257,236 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// Starts a background verification pass through a connected AI client.
+    /// This is deliberately throttled: the AI runs in a separate client
+    /// session, so repeated heartbeats must not spawn repeated processes.
+    func scheduleReferenceVerificationIfNeeded(paperID: String) {
+        guard autoVerifyReferences,
+              !referenceVerificationRunningPaperIDs.contains(paperID),
+              !questions.runningPaperIDs.contains(paperID) else { return }
+        let now = Date()
+        if let last = referenceVerificationLastAttempt[paperID],
+           now.timeIntervalSince(last) < 120 {
+            return
+        }
+        guard let paper = try? store.paper(id: paperID),
+              let all = try? store.references(paperID: paperID),
+              all.contains(where: { $0.status == .unverified }) else { return }
+        guard bridgeConnected,
+              let client = try? referenceVerificationClient(for: paper, requireConnected: true),
+              let launch = try? mcpLaunchConfiguration(for: paper, clientLabel: client.adapter.displayName) else {
+            return
+        }
+        referenceVerificationLastAttempt[paperID] = now
+        let batch = Array(all.filter { $0.status == .unverified }.prefix(10)).map(\.id)
+        Task {
+            await runReferenceVerification(paper: paper, referenceIDs: batch, client: client,
+                                           launch: launch, manual: false)
+        }
+    }
+
+    func verifyReference(_ referenceID: String) {
+        guard let reference = try? store.reference(id: referenceID) else {
+            referenceVerificationErrors[referenceID] = L("找不到这条参考文献。", "Reference not found.")
+            return
+        }
+        guard !verifyingReferenceIDs.contains(referenceID),
+              !referenceVerificationRunningPaperIDs.contains(reference.paperID) else { return }
+        guard let paper = try? store.paper(id: reference.paperID) else { return }
+        do {
+            guard bridgeConnected else {
+                throw PaperDeskError.missing(L("PaperDesk 的本机连接尚未启动。", "The PaperDesk local connection is not running yet."))
+            }
+            let client = try referenceVerificationClient(for: paper, requireConnected: false)
+            let launch = try mcpLaunchConfiguration(for: paper, clientLabel: client.adapter.displayName)
+            referenceVerificationErrors.removeValue(forKey: referenceID)
+            Task {
+                await runReferenceVerification(paper: paper, referenceIDs: [referenceID],
+                                               client: client, launch: launch, manual: true)
+            }
+        } catch {
+            referenceVerificationErrors[referenceID] = error.localizedDescription
+        }
+    }
+
+    private struct ReferenceVerificationClient {
+        let adapter: any QuestionClientAdapter
+        let project: URL
+    }
+
+    private func referenceVerificationClient(for paper: Paper,
+                                             requireConnected: Bool) throws -> ReferenceVerificationClient {
+        guard let project = try CodexPaperProject.existing(paper: paper, library: store.rootURL) else {
+            throw PaperDeskError.missing(L("请先为这篇文献准备项目，再让 AI 核实参考文献。", "Prepare the paper project before asking AI to verify references."))
+        }
+        let connected = connectedClients(forPaperID: paper.id)
+        var adapters: [any QuestionClientAdapter] = connected.compactMap { client in
+            if let id = client.clientID, let adapter = QuestionClientRegistry.adapter(id: id) {
+                return adapter
+            }
+            return QuestionClientRegistry.adapter(clientName: client.clientName)
+        }
+        if !requireConnected {
+            for adapter in QuestionClientRegistry.adapters where !adapters.contains(where: { $0.id == adapter.id }) {
+                adapters.append(adapter)
+            }
+        }
+        guard let adapter = adapters.first(where: { $0.isAvailable() }) else {
+            throw PaperDeskError.missing(requireConnected
+                ? L("没有检测到已连接且可用的 AI 客户端。", "No connected and available AI client was detected.")
+                : L("没有找到可用的 AI 客户端。", "No available AI client was found."))
+        }
+        return ReferenceVerificationClient(adapter: adapter, project: project)
+    }
+
+    private func runReferenceVerification(paper: Paper, referenceIDs: [String],
+                                          client: ReferenceVerificationClient,
+                                          launch: (command: String, arguments: [String]),
+                                          manual: Bool) async {
+        guard !referenceIDs.isEmpty else { return }
+        referenceVerificationRunningPaperIDs.insert(paper.id)
+        if manual {
+            for id in referenceIDs { verifyingReferenceIDs.insert(id) }
+        }
+        defer {
+            referenceVerificationRunningPaperIDs.remove(paper.id)
+            if manual {
+                for id in referenceIDs { verifyingReferenceIDs.remove(id) }
+            }
+        }
+        let prompt = referenceVerificationPrompt(paper: paper, referenceIDs: referenceIDs, manual: manual)
+        do {
+            _ = try await client.adapter.send(
+                project: client.project, sessionID: nil, prompt: prompt,
+                connector: launch.command, connectorArguments: launch.arguments)
+            if selectedPaper?.id == paper.id { refreshReferences() }
+            synchronizeProjectFiles(paperID: paper.id)
+            if manual {
+                for id in referenceIDs {
+                    if let reference = (try? store.reference(id: id)) ?? nil, reference.status != .verified {
+                        referenceVerificationErrors[id] = L("AI 没有返回可核实的作者、标题和年份，条目仍为未核实。", "The AI did not return verifiable authors, title, and year; the entry remains unverified.")
+                    } else {
+                        referenceVerificationErrors.removeValue(forKey: id)
+                    }
+                }
+            }
+        } catch {
+            if manual {
+                for id in referenceIDs {
+                    if let reference = (try? store.reference(id: id)) ?? nil,
+                       reference.status == .verified {
+                        referenceVerificationErrors.removeValue(forKey: id)
+                    } else {
+                        referenceVerificationErrors[id] = error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+
+    private func referenceVerificationPrompt(paper: Paper, referenceIDs: [String],
+                                             manual: Bool) -> String {
+        let listInstruction: String
+        if manual, referenceIDs.count == 1 {
+            listInstruction = "先调用 get_reference（reference_id=\(referenceIDs[0])）读取这一条。"
+        } else {
+            listInstruction = "先调用 list_references（status=\"unverified\", page_size=10）读取未核实条目。"
+        }
+        return """
+        这是 PaperDesk 的后台参考文献核实任务，不是用户在提问。不要回答用户问题，不要调用 capture_reading_state、save_discussion 或 cite_passage（本任务没有阅读快照），不要修改论文、笔记或 PDF。
+        当前论文：《\(paper.title)》
+        \(listInstruction)
+        逐条用 DOI、出版社、arXiv 或官方页面核对作者、标题和年份。只对核对成功的条目调用 verify_reference，传入 reference_id、authors、title、year，并尽量附带 venue、doi、arxiv_id、url、evidence_url。
+        无法确认或无法访问权威来源时，保持该条目未核实；不要猜测、不要编造。最多处理 10 条。完成后用一句话汇总核实结果并结束。
+        """
+    }
+
+    public func refreshReferences() {
+        guard let selectedPaper else {
+            references = []
+            referenceIndex = nil
+            return
+        }
+        do {
+            references = try store.references(paperID: selectedPaper.id)
+            referenceIndex = try store.referenceIndex(paperID: selectedPaper.id)
+        } catch {
+            report(error)
+        }
+    }
+
+    func scheduleReferenceIndexing(for paper: Paper, force: Bool = false) {
+        Task { await indexReferences(for: paper, force: force) }
+    }
+
+    func reindexReferences() {
+        guard let selectedPaper else { return }
+        scheduleReferenceIndexing(for: selectedPaper, force: true)
+    }
+
+    private func indexReferences(for paper: Paper, force: Bool) async {
+        guard !referenceIndexingPaperIDs.contains(paper.id) else { return }
+        if !force, let existing = try? store.referenceIndex(paperID: paper.id),
+           existing.parserVersion >= PaperReferenceParser.version,
+           existing.state == .ready || existing.state == .unavailable || existing.state == .failed {
+            return
+        }
+        referenceIndexingPaperIDs.insert(paper.id)
+        if selectedPaper?.id == paper.id {
+            referenceIndex = PaperReferenceIndex(paperID: paper.id, state: .indexing,
+                                                 parserVersion: PaperReferenceParser.version)
+        }
+        let pdfURL = store.pdfURL(for: paper)
+        let pageCount = paper.pageCount
+        let paperID = paper.id
+        let result: Result<PaperReferenceIndexResult, Error> = await Task.detached(priority: .utility) {
+            Result { try PaperReferenceIndexer.index(pdfURL: pdfURL, pageCount: pageCount) }
+        }.value
+        finishReferenceIndexing(paperID: paperID, result: result)
+    }
+
+    private func startReferenceBackfillIfNeeded() {
+        guard !referenceBackfillStarted else { return }
+        referenceBackfillStarted = true
+        let pending = papers
+        Task(priority: .utility) {
+            for paper in pending {
+                if Task.isCancelled { return }
+                await indexReferences(for: paper, force: false)
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+    }
+
+    private func finishReferenceIndexing(paperID: String, result: Result<PaperReferenceIndexResult, Error>) {
+        referenceIndexingPaperIDs.remove(paperID)
+        switch result {
+        case .success(let indexed):
+            do {
+                if indexed.drafts.isEmpty {
+                    try store.markReferenceIndex(paperID: paperID, state: .unavailable,
+                                                 parserVersion: PaperReferenceParser.version,
+                                                 headingPageIndex: indexed.headingPageIndex, entryCount: 0)
+                } else {
+                    try store.replacePDFBibliography(paperID: paperID, entries: indexed.drafts,
+                                                     headingPageIndex: indexed.headingPageIndex,
+                                                     parserVersion: PaperReferenceParser.version)
+                }
+                referenceVerificationLastAttempt.removeValue(forKey: paperID)
+                if selectedPaper?.id == paperID { refreshReferences() }
+                synchronizeProjectFiles(paperID: paperID)
+                scheduleReferenceVerificationIfNeeded(paperID: paperID)
+            } catch {
+                report(error)
+            }
+        case .failure(let error):
+            try? store.markReferenceIndex(paperID: paperID, state: .failed,
+                                          parserVersion: PaperReferenceParser.version,
+                                          error: error.localizedDescription)
+            if selectedPaper?.id == paperID { refreshReferences() }
+        }
+    }
+
     public func openPaper(_ paper: Paper) {
         do {
             let freshPaper = try store.paper(id: paper.id)
@@ -250,7 +513,10 @@ public final class AppModel: ObservableObject {
             clearCitationMarks()
             refreshNotes()
             refreshDiscussion()
+            refreshReferences()
             refreshDetectedMCPProcesses()
+            scheduleReferenceIndexing(for: freshPaper)
+            scheduleReferenceVerificationIfNeeded(paperID: freshPaper.id)
             // Reopening a completed paper must not silently move it back to
             // the in-progress state. The store calls this state "read".
             if freshPaper.readingState != "read" {
@@ -304,7 +570,7 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    func scope(forPaperID id: String) -> ContextScope { paperScopes[id] ?? .selection }
+    func scope(forPaperID id: String) -> ContextScope { paperScopes[id] ?? .document }
     func sharesNotes(forPaperID id: String) -> Bool { paperNoteSharing[id] ?? false }
 
     public func openPDF(url: URL) {
@@ -546,17 +812,17 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    /// Paints one answer's numbered citations on the PDF. The previous
-    /// answer's marks disappear, so the reader always sees exactly the
-    /// sources of the answer being read.
+    /// Selects one answer and paints its numbered citations on the PDF. The
+    /// previous answer's marks disappear, so the reader always sees exactly
+    /// the sources of the answer being read. Selecting an answer that has no
+    /// citations is still allowed; it simply clears the marks.
     func activateCitations(for message: PaperChatMessage) {
-        guard message.role == .assistant, let citations = message.citations, !citations.isEmpty,
-              let paper = selectedPaper else {
+        guard message.role == .assistant, let paper = selectedPaper else {
             clearCitationMarks()
             return
         }
         var marks: [CitationMark] = []
-        for citation in citations {
+        for citation in message.citations ?? [] {
             guard let context = try? store.context(id: citation.contextID),
                   context.paperID == paper.id,
                   context.documentHash == paper.fileHash,

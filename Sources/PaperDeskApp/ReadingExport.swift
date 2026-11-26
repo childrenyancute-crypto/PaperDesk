@@ -4,8 +4,9 @@ import UniformTypeIdentifiers
 import PaperDeskCore
 
 private struct ReadingExport: Encodable {
-    let version = 4
+    let version = 6
     let paper: Paper
+    let references: [PaperReference]
     let notes: [ReadingNote]
     let contexts: [ContextSnapshot]
     let readingInstructions: String
@@ -30,6 +31,7 @@ extension AppModel {
             var extractiveSources: [String: [ExtractiveSource]] = [:]
             var coverage: [String: ExtractiveCoverage] = [:]
             var ids = Set(chat.messages.compactMap(\.contextID) + chat.messages.flatMap { $0.sourceContextIDs ?? [] })
+            ids.formUnion(chat.messages.flatMap { $0.citations ?? [] }.map(\.contextID))
             ids.formUnion(readingState.selections.map(\.id))
             for note in notes {
                 let sources = try store.noteContextIDs(noteID: note.id)
@@ -40,7 +42,8 @@ extension AppModel {
                 coverage[note.id] = try store.extractiveCoverage(noteID: note.id)
             }
             let contexts = try ids.sorted().compactMap { try store.context(id: $0) }
-            let package = ReadingExport(paper: paper, notes: notes, contexts: contexts,
+            let references = try store.references(paperID: paper.id)
+            let package = ReadingExport(paper: paper, references: references, notes: notes, contexts: contexts,
                                         readingInstructions: chat.readingInstructions, discussion: chat.messages,
                                         readingState: readingState, questionSnapshots: snapshots,
                                         noteSources: noteSources, extractiveSources: extractiveSources, extractiveCoverage: coverage)

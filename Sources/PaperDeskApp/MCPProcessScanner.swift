@@ -1,9 +1,9 @@
 import Foundation
 import PaperDeskCore
 
-/// One live `paperdesk-mcp` helper process. Its presence is the most direct
-/// evidence that an external client has an open MCP connection to PaperDesk,
-/// independent of the heartbeat (older helpers do not send one).
+/// A `paperdesk-mcp` helper process discovered locally. This is auxiliary
+/// evidence used to recover a missing client label for a heartbeat that already
+/// confirmed the connection; the process alone is never a displayed connection.
 struct DetectedMCPProcess: Equatable, Sendable {
     let pid: Int32
     let paperID: String

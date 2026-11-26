@@ -236,6 +236,333 @@ public final class LibraryStore {
         }
     }
 
+    // MARK: - Paper references
+
+    public func referenceIndex(paperID: String) throws -> PaperReferenceIndex? {
+        try withStatement("SELECT state, parser_version, heading_page_index, entry_count, indexed_at, error FROM paper_reference_index WHERE paper_id = ?") { statement in
+            bindText(statement, 1, paperID)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            let state = PaperReferenceIndex.State(rawValue: try requiredText(statement, 0)) ?? .failed
+            return PaperReferenceIndex(
+                paperID: paperID,
+                state: state,
+                parserVersion: Int(sqlite3_column_int(statement, 1)),
+                headingPageIndex: sqlite3_column_type(statement, 2) == SQLITE_NULL ? nil : Int(sqlite3_column_int(statement, 2)),
+                entryCount: Int(sqlite3_column_int(statement, 3)),
+                indexedAt: sqlite3_column_type(statement, 4) == SQLITE_NULL ? nil : date(sqlite3_column_double(statement, 4)),
+                error: optionalText(statement, 5)
+            )
+        }
+    }
+
+    public func references(paperID: String) throws -> [PaperReference] {
+        try withStatement("SELECT \(referenceColumns) FROM paper_references WHERE paper_id = ? ORDER BY entry_index ASC, label COLLATE NOCASE ASC") { statement in
+            bindText(statement, 1, paperID)
+            var result: [PaperReference] = []
+            while sqlite3_step(statement) == SQLITE_ROW { result.append(try makeReference(statement)) }
+            try checkLastStep(statement)
+            return result
+        }
+    }
+
+    public func reference(id: String) throws -> PaperReference? {
+        try withStatement("SELECT \(referenceColumns) FROM paper_references WHERE id = ?") { statement in
+            bindText(statement, 1, id)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            return try makeReference(statement)
+        }
+    }
+
+    public func markReferenceIndex(paperID: String, state: PaperReferenceIndex.State,
+                                   parserVersion: Int, headingPageIndex: Int? = nil,
+                                   entryCount: Int = 0, error: String? = nil) throws {
+        _ = try paper(id: paperID)
+        let indexedAt = state == .ready ? Date() : nil
+        try transaction {
+            try withStatement("""
+                INSERT INTO paper_reference_index (paper_id,state,parser_version,heading_page_index,entry_count,indexed_at,error)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(paper_id) DO UPDATE SET state=excluded.state,
+                    parser_version=excluded.parser_version,
+                    heading_page_index=excluded.heading_page_index,
+                    entry_count=excluded.entry_count,
+                    indexed_at=excluded.indexed_at,
+                    error=excluded.error
+                """) { statement in
+                bindText(statement, 1, paperID)
+                bindText(statement, 2, state.rawValue)
+                bindInt(statement, 3, parserVersion)
+                if let headingPageIndex { bindInt(statement, 4, headingPageIndex) } else { sqlite3_bind_null(statement, 4) }
+                bindInt(statement, 5, entryCount)
+                if let indexedAt { bindDate(statement, 6, indexedAt) } else { sqlite3_bind_null(statement, 6) }
+                if let error { bindText(statement, 7, error) } else { sqlite3_bind_null(statement, 7) }
+                try stepDone(statement)
+            }
+        }
+    }
+
+    /// Replaces the locally extracted bibliography. Every unverified row is
+    /// rebuilt from the new parse; AI-verified rows survive by fingerprint,
+    /// label, or title+year and keep their confirmed fields.
+    public func replacePDFBibliography(paperID: String, entries: [PaperReferenceDraft],
+                                       headingPageIndex: Int?, parserVersion: Int) throws {
+        _ = try paper(id: paperID)
+        var seen = Set<String>()
+        let drafts = entries.filter { seen.insert($0.fingerprint).inserted }
+        let existing = try references(paperID: paperID)
+        let verified = existing.filter { $0.source == .pdfBibliography && $0.status == .verified }
+        var byFingerprint: [String: PaperReference] = [:]
+        var byLabel: [String: PaperReference] = [:]
+        var byTitleYear: [String: PaperReference] = [:]
+        var titleYearCounts: [String: Int] = [:]
+        for reference in verified {
+            if let fingerprint = reference.fingerprint, byFingerprint[fingerprint] == nil {
+                byFingerprint[fingerprint] = reference
+            }
+            let label = normalizedReferenceLabel(reference.label)
+            if byLabel[label] == nil { byLabel[label] = reference }
+            if let key = titleYearKey(label: nil, title: reference.title, year: reference.year) {
+                titleYearCounts[key, default: 0] += 1
+                byTitleYear[key] = reference
+            }
+        }
+        for (key, count) in titleYearCounts where count > 1 {
+            byTitleYear.removeValue(forKey: key)
+        }
+        let draftLabels = Set(drafts.map { normalizedReferenceLabel($0.label) })
+        let now = Date()
+        var keptIDs = Set<String>()
+        try transaction {
+            // Local extraction is disposable. Verified rows are not.
+            for reference in existing where reference.source == .pdfBibliography && reference.status == .unverified {
+                try withStatement("DELETE FROM paper_references WHERE id = ?") { statement in
+                    bindText(statement, 1, reference.id)
+                    try stepDone(statement)
+                }
+            }
+            for draft in drafts {
+                let label = normalizedReferenceLabel(draft.label)
+                let titleYear = titleYearKey(label: nil, title: draft.title, year: draft.year)
+                let reference = byFingerprint[draft.fingerprint].flatMap { keptIDs.contains($0.id) ? nil : $0 }
+                    ?? byLabel[label].flatMap { keptIDs.contains($0.id) ? nil : $0 }
+                    ?? titleYear.flatMap { byTitleYear[$0] }.flatMap { keptIDs.contains($0.id) ? nil : $0 }
+                if let reference {
+                    keptIDs.insert(reference.id)
+                    try withStatement("""
+                        UPDATE paper_references SET label=?, entry_index=?, first_author=?, raw_text=?,
+                            page_index=?, page_label=?, parser_version=?, updated_at=?
+                        WHERE id=?
+                        """) { statement in
+                        bindText(statement, 1, draft.label)
+                        bindInt(statement, 2, draft.entryIndex)
+                        bindOptionalText(statement, 3, firstAuthor(from: reference.authors) ?? draft.firstAuthor)
+                        bindText(statement, 4, draft.rawText)
+                        bindInt(statement, 5, draft.pageIndex)
+                        bindText(statement, 6, draft.pageLabel)
+                        bindInt(statement, 7, parserVersion)
+                        bindDate(statement, 8, now)
+                        bindText(statement, 9, reference.id)
+                        try stepDone(statement)
+                    }
+                } else {
+                    let reference = PaperReference(
+                        paperID: paperID, label: draft.label, entryIndex: draft.entryIndex,
+                        authors: draft.authors, firstAuthor: draft.firstAuthor, title: draft.title,
+                        year: draft.year, venue: draft.venue, doi: draft.doi, arxivID: draft.arxivID,
+                        url: draft.url, rawText: draft.rawText, status: .unverified,
+                        source: .pdfBibliography, pageIndex: draft.pageIndex, pageLabel: draft.pageLabel,
+                        parserVersion: parserVersion, fingerprint: draft.fingerprint,
+                        createdAt: now, updatedAt: now)
+                    keptIDs.insert(reference.id)
+                    try insertReference(reference)
+                }
+            }
+            // Merge duplicate verified rows that describe the same work as a
+            // kept row, or whose label still exists in the new bibliography.
+            let kept = verified.filter { keptIDs.contains($0.id) }
+            let keptFingerprints = Set(kept.compactMap(\.fingerprint))
+            let keptTitleYears = Set(kept.compactMap { titleYearKey(label: nil, title: $0.title, year: $0.year) })
+            for reference in verified where !keptIDs.contains(reference.id) {
+                let sameWork = reference.fingerprint.map { keptFingerprints.contains($0) } ?? false
+                let sameTitleYear = titleYearKey(label: nil, title: reference.title, year: reference.year)
+                    .map { keptTitleYears.contains($0) } ?? false
+                guard draftLabels.contains(normalizedReferenceLabel(reference.label))
+                        || sameWork || sameTitleYear else { continue }
+                try withStatement("DELETE FROM paper_references WHERE id = ?") { statement in
+                    bindText(statement, 1, reference.id)
+                    try stepDone(statement)
+                }
+            }
+            try withStatement("""
+                INSERT INTO paper_reference_index (paper_id,state,parser_version,heading_page_index,entry_count,indexed_at,error)
+                VALUES (?,?,?,?,?,?,NULL)
+                ON CONFLICT(paper_id) DO UPDATE SET state=excluded.state,
+                    parser_version=excluded.parser_version,
+                    heading_page_index=excluded.heading_page_index,
+                    entry_count=excluded.entry_count,
+                    indexed_at=excluded.indexed_at,
+                    error=NULL
+                """) { statement in
+                bindText(statement, 1, paperID)
+                bindText(statement, 2, PaperReferenceIndex.State.ready.rawValue)
+                bindInt(statement, 3, parserVersion)
+                if let headingPageIndex { bindInt(statement, 4, headingPageIndex) } else { sqlite3_bind_null(statement, 4) }
+                bindInt(statement, 5, drafts.count)
+                bindDate(statement, 6, now)
+                try stepDone(statement)
+            }
+        }
+    }
+
+    private func normalizedReferenceLabel(_ label: String) -> String {
+        label.trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
+            .replacingOccurrences(of: " ", with: "")
+            .lowercased()
+    }
+
+    private func titleYearKey(label: String?, title: String?, year: Int?) -> String? {
+        guard let year, let title else { return nil }
+        let normalized = title.lowercased().filter { $0.isLetter || $0.isNumber }
+        guard normalized.count >= 4 else { return nil }
+        return normalized + "|" + String(year)
+    }
+
+    @discardableResult
+    public func verifyReference(id: String, authors: String?, title: String?, year: Int?,
+                                venue: String?, doi: String?, arxivID: String?, url: String?,
+                                bibtex: String?, verifiedBy: String, evidenceURL: String?) throws -> PaperReference {
+        guard let current = try reference(id: id) else { throw PaperDeskError.missing("找不到这条参考文献") }
+        let now = Date()
+        let nextAuthors = nonEmpty(authors) ?? current.authors
+        let nextTitle = nonEmpty(title) ?? current.title
+        let nextVenue = nonEmpty(venue) ?? current.venue
+        let nextDOI = nonEmpty(doi) ?? current.doi
+        let nextArxiv = nonEmpty(arxivID) ?? current.arxivID
+        let nextURL = nonEmpty(url) ?? current.url
+        let nextBibtex = nonEmpty(bibtex) ?? current.bibtex
+        let nextYear = year ?? current.year
+        try withStatement("""
+            UPDATE paper_references SET authors=?, first_author=?, title=?, year=?, venue=?, doi=?,
+                arxiv_id=?, url=?, bibtex=?, status=?, verified_at=?, verified_by=?, evidence_url=?, updated_at=?
+            WHERE id=?
+            """) { statement in
+            bindOptionalText(statement, 1, nextAuthors)
+            bindOptionalText(statement, 2, firstAuthor(from: nextAuthors))
+            bindOptionalText(statement, 3, nextTitle)
+            if let nextYear { bindInt(statement, 4, nextYear) } else { sqlite3_bind_null(statement, 4) }
+            bindOptionalText(statement, 5, nextVenue)
+            bindOptionalText(statement, 6, nextDOI)
+            bindOptionalText(statement, 7, nextArxiv)
+            bindOptionalText(statement, 8, nextURL)
+            bindOptionalText(statement, 9, nextBibtex)
+            bindText(statement, 10, PaperReferenceStatus.verified.rawValue)
+            bindDate(statement, 11, now)
+            bindText(statement, 12, verifiedBy)
+            bindOptionalText(statement, 13, evidenceURL)
+            bindDate(statement, 14, now)
+            bindText(statement, 15, id)
+            try stepDone(statement)
+        }
+        guard let updated = try reference(id: id) else { throw PaperDeskError.missing("找不到这条参考文献") }
+        return updated
+    }
+
+    private static let referenceColumns = "id,paper_id,label,entry_index,authors,first_author,title,year,venue,doi,arxiv_id,url,bibtex,raw_text,status,source,page_index,page_label,parser_version,fingerprint,verified_at,verified_by,evidence_url,created_at,updated_at"
+
+    private var referenceColumns: String { Self.referenceColumns }
+
+    private func insertReference(_ reference: PaperReference) throws {
+        try withStatement("""
+            INSERT INTO paper_references (\(Self.referenceColumns))
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """) { statement in
+            bindText(statement, 1, reference.id)
+            bindText(statement, 2, reference.paperID)
+            bindText(statement, 3, reference.label)
+            bindInt(statement, 4, reference.entryIndex)
+            bindOptionalText(statement, 5, reference.authors)
+            bindOptionalText(statement, 6, reference.firstAuthor)
+            bindOptionalText(statement, 7, reference.title)
+            if let year = reference.year { bindInt(statement, 8, year) } else { sqlite3_bind_null(statement, 8) }
+            bindOptionalText(statement, 9, reference.venue)
+            bindOptionalText(statement, 10, reference.doi)
+            bindOptionalText(statement, 11, reference.arxivID)
+            bindOptionalText(statement, 12, reference.url)
+            bindOptionalText(statement, 13, reference.bibtex)
+            bindText(statement, 14, reference.rawText)
+            bindText(statement, 15, reference.status.rawValue)
+            bindText(statement, 16, reference.source.rawValue)
+            bindInt(statement, 17, reference.pageIndex)
+            bindText(statement, 18, reference.pageLabel)
+            bindInt(statement, 19, reference.parserVersion)
+            bindOptionalText(statement, 20, reference.fingerprint)
+            if let verifiedAt = reference.verifiedAt { bindDate(statement, 21, verifiedAt) } else { sqlite3_bind_null(statement, 21) }
+            bindOptionalText(statement, 22, reference.verifiedBy)
+            bindOptionalText(statement, 23, reference.evidenceURL)
+            bindDate(statement, 24, reference.createdAt)
+            bindDate(statement, 25, reference.updatedAt)
+            try stepDone(statement)
+        }
+    }
+
+    private func makeReference(_ statement: OpaquePointer) throws -> PaperReference {
+        let year = sqlite3_column_type(statement, 7) == SQLITE_NULL ? nil : Int(sqlite3_column_int(statement, 7))
+        return PaperReference(
+            id: try requiredText(statement, 0),
+            paperID: try requiredText(statement, 1),
+            label: try requiredText(statement, 2),
+            entryIndex: Int(sqlite3_column_int(statement, 3)),
+            authors: optionalText(statement, 4),
+            firstAuthor: optionalText(statement, 5),
+            title: optionalText(statement, 6),
+            year: year,
+            venue: optionalText(statement, 8),
+            doi: optionalText(statement, 9),
+            arxivID: optionalText(statement, 10),
+            url: optionalText(statement, 11),
+            bibtex: optionalText(statement, 12),
+            rawText: try requiredText(statement, 13),
+            status: PaperReferenceStatus(rawValue: try requiredText(statement, 14)) ?? .unverified,
+            source: PaperReferenceSource(rawValue: try requiredText(statement, 15)) ?? .pdfBibliography,
+            pageIndex: Int(sqlite3_column_int(statement, 16)),
+            pageLabel: try requiredText(statement, 17),
+            parserVersion: Int(sqlite3_column_int(statement, 18)),
+            fingerprint: optionalText(statement, 19),
+            verifiedAt: sqlite3_column_type(statement, 20) == SQLITE_NULL ? nil : date(sqlite3_column_double(statement, 20)),
+            verifiedBy: optionalText(statement, 21),
+            evidenceURL: optionalText(statement, 22),
+            createdAt: date(sqlite3_column_double(statement, 23)),
+            updatedAt: date(sqlite3_column_double(statement, 24))
+        )
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func firstAuthor(from authors: String?) -> String? {
+        guard let authors = nonEmpty(authors) else { return nil }
+        var cleaned = authors.replacingOccurrences(of: "et al.", with: "")
+            .replacingOccurrences(of: "et al", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let separator = cleaned.range(of: #"\s+(?:and|&)\s+"#, options: .regularExpression) {
+            cleaned = String(cleaned[..<separator.lowerBound])
+        }
+        let segment: String
+        if let comma = cleaned.firstIndex(of: ",") {
+            segment = String(cleaned[..<comma])
+        } else {
+            segment = cleaned
+        }
+        let words = segment.split(whereSeparator: { !$0.isLetter && $0 != "-" && $0 != "’" && $0 != "'" })
+        let candidate = words.count > 1 ? String(words[words.count - 1]) : segment
+        let normalized = candidate.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines
+            .union(CharacterSet(charactersIn: ".,;:()[]")))
+        return normalized.count >= 2 ? normalized : nil
+    }
+
     public func setProjectName(paperID: String, name: String) throws {
         _ = try paper(id: paperID)
         try transaction {
@@ -474,7 +801,12 @@ public final class LibraryStore {
                                  origin: RecordOrigin? = nil, manuallyRecorded: Bool = false,
                                  sharedWithAI: Bool = false,
                                  conversationID: String? = nil, conversationTitle: String? = nil,
-                                 continuingFrom previousDiscussionID: String? = nil) throws -> PaperChatMessage {
+                                 continuingFrom previousDiscussionID: String? = nil,
+                                 feedbackKind: ReadingFeedbackKind? = nil,
+                                 feedbackEvidence: String? = nil,
+                                 referencedWorks: [MessageReference]? = nil,
+                                 citationWarnings: [String]? = nil,
+                                 answerMode: ReadingAnswerMode? = nil) throws -> PaperChatMessage {
         let paper = try paper(id: paperID)
         let snapshot = try readingSnapshot(id: snapshotID)
         guard let snapshot, snapshot.state.paperID == paperID, snapshot.state.documentHash == paper.fileHash else {
@@ -483,6 +815,22 @@ public final class LibraryStore {
         let questionKey = question.trimmingCharacters(in: .whitespacesAndNewlines)
         let answerKey = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !questionKey.isEmpty, !answerKey.isEmpty else { throw PaperDeskError.invalid("讨论内容不能为空") }
+        let hasFeedbackKind = feedbackKind != nil
+        let hasFeedbackEvidence = feedbackEvidence != nil
+        guard hasFeedbackKind == hasFeedbackEvidence else {
+            throw PaperDeskError.invalid("反馈类型和证据必须同时提供")
+        }
+        if feedbackKind != nil {
+            guard !manuallyRecorded else { throw PaperDeskError.invalid("手动记录不能附加阅读反馈") }
+            guard let feedbackEvidence,
+                  !feedbackEvidence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  feedbackEvidence.count <= 240 else {
+                throw PaperDeskError.invalid("反馈证据长度必须为 1 到 240 个字符")
+            }
+            guard questionKey.contains(feedbackEvidence) else {
+                throw PaperDeskError.invalid("反馈证据必须逐字来自当前问题")
+            }
+        }
         let ids = uniqueStrings(sourceContextIDs)
         let allowed = Set(snapshot.state.selections.map(\.id))
         guard ids.allSatisfy({ allowed.contains($0) }) else { throw PaperDeskError.conflict("讨论引用了本次阅读状态之外的选区") }
@@ -498,6 +846,26 @@ public final class LibraryStore {
               Set(normalizedCitations.map(\.label)).count == normalizedCitations.count,
               normalizedCitations.allSatisfy({ citationContextIDs.contains($0.contextID) }) else {
             throw PaperDeskError.conflict("讨论引用了不属于这份阅读状态的出处")
+        }
+        let normalizedReferences = referencedWorks.map { works in
+            works.filter { !$0.referenceID.isEmpty && !$0.label.isEmpty }
+        }
+        guard normalizedReferences?.count == referencedWorks?.count,
+              (normalizedReferences?.count ?? 0) <= 500,
+              Set(normalizedReferences?.map(\.referenceID) ?? []).count == (normalizedReferences?.count ?? 0) else {
+            throw PaperDeskError.invalid("讨论包含重复或无效的参考文献链接")
+        }
+        if let normalizedReferences {
+            let availableReferenceIDs = Set(try references(paperID: paperID).map(\.id))
+            guard normalizedReferences.allSatisfy({ availableReferenceIDs.contains($0.referenceID) }) else {
+                throw PaperDeskError.conflict("讨论引用了不属于当前文献的参考文献条目")
+            }
+        }
+        let normalizedCitationWarnings = citationWarnings?.map {
+            String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
+        }.filter { !$0.isEmpty }
+        guard normalizedCitationWarnings?.count ?? 0 <= 20 else {
+            throw PaperDeskError.invalid("引用核对提示不能超过 20 条")
         }
         let key = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty, key.count <= 256 else { throw PaperDeskError.invalid("讨论缺少有效的幂等标识") }
@@ -521,6 +889,11 @@ public final class LibraryStore {
             payloadObject["sharedWithAI"] = sharedWithAI
         }
         if let previousDiscussionID { payloadObject["previousDiscussionID"] = previousDiscussionID }
+        if let feedbackKind, let feedbackEvidence {
+            payloadObject["feedbackKind"] = feedbackKind.rawValue
+            payloadObject["feedbackEvidence"] = feedbackEvidence
+        }
+        if let answerMode { payloadObject["answerMode"] = answerMode.rawValue }
         let payload = String(decoding: try JSONSerialization.data(withJSONObject: payloadObject, options: [.sortedKeys]), as: UTF8.self)
         return try transaction {
             var session = try chatSession(paperID: paperID)
@@ -542,16 +915,44 @@ public final class LibraryStore {
                 }
                 resolvedConversationID = previousConversationID
             }
+            let readingFeedback: ReadingFeedback?
+            if let feedbackKind, let feedbackEvidence {
+                guard let resolvedConversationID = normalizedConversationIdentifier(resolvedConversationID) else {
+                    throw PaperDeskError.conflict("无法为反馈找到所属的外部对话")
+                }
+                let latestAssistant = session.messages.last { message in
+                    message.role == .assistant && !message.isExtractiveSummary
+                        && normalizedConversationIdentifier(message.conversationID) == resolvedConversationID
+                }
+                guard let latestAssistant,
+                      latestAssistant.manuallyRecorded != true,
+                      latestAssistant.origin?.clientSourceLabel == effectiveOrigin?.clientSourceLabel,
+                      latestAssistant.origin != nil, effectiveOrigin != nil else {
+                    throw PaperDeskError.conflict("无法为反馈找到同一文献、对话和客户端的上一条回答")
+                }
+                if let previousDiscussionID {
+                    guard previousDiscussionID == latestAssistant.id else {
+                        throw PaperDeskError.conflict("反馈只能关联同一对话中最新的上一条回答")
+                    }
+                }
+                readingFeedback = ReadingFeedback(kind: feedbackKind, evidence: feedbackEvidence, answerID: latestAssistant.id)
+            } else {
+                readingFeedback = nil
+            }
             let first = snapshot.state.selections.first(where: { ids.contains($0.id) })
             let user = PaperChatMessage(role: .user, text: question, pageLabel: first?.context.pageLabel, contextID: first?.id,
                                         sourcePageIndex: first?.context.pageIndex, readingSnapshotID: snapshotID, sourceContextIDs: ids,
                                         origin: effectiveOrigin, manuallyRecorded: manuallyRecorded, sharedWithAI: sharedWithAI,
-                                        conversationID: resolvedConversationID, conversationTitle: effectiveTitle)
+                                        conversationID: resolvedConversationID, conversationTitle: effectiveTitle,
+                                        readingFeedback: readingFeedback)
             let assistant = PaperChatMessage(role: .assistant, text: answer, pageLabel: first?.context.pageLabel, contextID: first?.id,
                                              sourcePageIndex: first?.context.pageIndex, readingSnapshotID: snapshotID, sourceContextIDs: ids,
                                              origin: effectiveOrigin, manuallyRecorded: manuallyRecorded, sharedWithAI: sharedWithAI,
                                              conversationID: resolvedConversationID, conversationTitle: effectiveTitle,
-                                             citations: normalizedCitations.isEmpty ? nil : normalizedCitations)
+                                             citations: normalizedCitations.isEmpty ? nil : normalizedCitations,
+                                             referencedWorks: normalizedReferences,
+                                             citationWarnings: normalizedCitationWarnings?.isEmpty == false ? normalizedCitationWarnings : nil,
+                                             answerMode: answerMode)
             session.messages.append(contentsOf: [user, assistant])
             try saveChatSession(session, paperID: paperID)
             try withStatement("INSERT INTO discussion_requests (idempotency_key,paper_id,payload,response_id) VALUES (?,?,?,?)") { statement in
@@ -1463,6 +1864,49 @@ public final class LibraryStore {
         )
         """)
         try execute("""
+        CREATE TABLE IF NOT EXISTS paper_references (
+            id TEXT PRIMARY KEY NOT NULL,
+            paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            label TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK(entry_index >= 0),
+            authors TEXT,
+            first_author TEXT,
+            title TEXT,
+            year INTEGER,
+            venue TEXT,
+            doi TEXT,
+            arxiv_id TEXT,
+            url TEXT,
+            bibtex TEXT,
+            raw_text TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source TEXT NOT NULL,
+            page_index INTEGER NOT NULL CHECK(page_index >= 0),
+            page_label TEXT NOT NULL,
+            parser_version INTEGER NOT NULL,
+            fingerprint TEXT,
+            verified_at REAL,
+            verified_by TEXT,
+            evidence_url TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """)
+        try execute("CREATE INDEX IF NOT EXISTS paper_references_paper_index ON paper_references(paper_id, entry_index)")
+        try execute("CREATE INDEX IF NOT EXISTS paper_references_label_index ON paper_references(paper_id, label COLLATE NOCASE)")
+        try execute("CREATE UNIQUE INDEX IF NOT EXISTS paper_references_fingerprint_unique ON paper_references(paper_id, fingerprint) WHERE fingerprint IS NOT NULL")
+        try execute("""
+        CREATE TABLE IF NOT EXISTS paper_reference_index (
+            paper_id TEXT PRIMARY KEY NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            parser_version INTEGER NOT NULL,
+            heading_page_index INTEGER,
+            entry_count INTEGER NOT NULL DEFAULT 0,
+            indexed_at REAL,
+            error TEXT
+        )
+        """)
+        try execute("""
         CREATE TABLE IF NOT EXISTS paper_chats (
             paper_id TEXT PRIMARY KEY NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
             session_json TEXT NOT NULL
@@ -1497,7 +1941,7 @@ public final class LibraryStore {
         // by an intermediate build whose table declaration used a weaker
         // project-scoped uniqueness rule.
         try execute("CREATE UNIQUE INDEX IF NOT EXISTS question_bindings_backend_session_unique ON question_bindings(backend, external_session_id)")
-        try execute("PRAGMA user_version = 9")
+        try execute("PRAGMA user_version = 10")
     }
 
     private func execute(_ sql: String) throws {
@@ -1712,6 +2156,11 @@ public final class LibraryStore {
     private func normalizedKey(_ key: String?) -> String? {
         guard let key else { return nil }
         let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+    private func normalizedConversationIdentifier(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized.isEmpty ? nil : normalized
     }
     private func uniqueStrings(_ values: [String]) -> [String] {

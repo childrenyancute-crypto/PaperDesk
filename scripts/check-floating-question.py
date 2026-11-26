@@ -11,8 +11,10 @@ CLIENT = r'''#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 import traceback
 
 
@@ -55,12 +57,30 @@ def paperdesk(command, action):
 
 
 prompt = sys.stdin.read()
+assert all(field in prompt for field in ("cite_passage", "selection_context_id", "connection_policy", "⟦", "citations"))
 if Path(sys.argv[0]).name == "codex":
     settings = dict(sys.argv[index + 1].split("=", 1) for index, arg in enumerate(sys.argv[:-1]) if arg == "-c")
     command = settings["mcp_servers.paperdesk.command"]
     assert r"\/" not in command and os.path.isfile(json.loads(command))
     assert "--question-request" in json.loads(settings["mcp_servers.paperdesk.args"])
     assert json.loads(settings["sandbox_mode"]) == "read-only"
+    for tool in ("capture_reading_state", "cite_passage", "save_discussion"):
+        assert json.loads(settings[f"mcp_servers.paperdesk.tools.{tool}.approval_mode"]) == "approve"
+    if "First frozen question" in prompt:
+        fixture = Path(os.environ["PAPERDESK_QUESTION_TEST_CLIENTS"])
+        def stopped(_signal, _frame):
+            (fixture / "codex-stopped").touch()
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, stopped)
+        emit(type="thread.started", thread_id="018fcc03-c390-7c5b-8d0f-a952e9c104f5")
+        sys.stdout.write('{"type":"turn.')
+        sys.stdout.flush()
+        time.sleep(0.05)
+        sys.stdout.write('started"}\n')
+        sys.stdout.flush()
+        (fixture / "codex-waiting").touch()
+        time.sleep(10)
+        raise AssertionError("The waiting Codex request was not stopped")
     if "Legacy Codex continuation" in prompt:
         session = "018fcc03-c390-7c5b-8d0f-a952e9c104f3"
         assert "resume" in sys.argv and session in sys.argv
@@ -68,7 +88,18 @@ if Path(sys.argv[0]).name == "codex":
     else:
         assert "Separate Codex question" in prompt and "resume" not in sys.argv
         session = "018fcc03-c390-7c5b-8d0f-a952e9c104f4"
-        answer = "Codex answer"
+        answer = "Codex answer ⟦1⟧"
+        connector = [json.loads(command)] + json.loads(settings["mcp_servers.paperdesk.args"])
+
+        def cite_selection(call):
+            status = call("paperdesk_connection_status")
+            snapshot = call("capture_reading_state")
+            assert snapshot["connection_policy"] == status and status["citation_mode"] == "selected_passages"
+            citation = call("cite_passage", snapshot_id=snapshot["snapshot_id"],
+                            selection_context_id=snapshot["context_id"])
+            assert citation["number"] == 1
+
+        paperdesk(connector, cite_selection)
     emit(type="thread.started", thread_id=session)
     emit(type="item.completed", item=dict(type="agent_message", text=answer))
     emit(type="turn.completed")
@@ -77,11 +108,13 @@ if Path(sys.argv[0]).name == "codex":
 session = "ses_paperdesk_fixture"
 if "Failed question" in prompt:
     sys.exit(2)
+emit(type="step_start", sessionID=session, part=dict(type="step-start"))
 if "Follow-up question" in prompt:
     assert sys.argv[sys.argv.index("--session") + 1] == session
     answer = "Follow-up answer"
 else:
     assert "First frozen question" in prompt and "--session" not in sys.argv
+    time.sleep(0.2)
     answer = "First answer ⟦1⟧."
     connector = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])["mcp"]["paperdesk"]["command"]
 
@@ -89,18 +122,15 @@ else:
         snapshot = call("capture_reading_state")
         assert snapshot["current_page_index"] == 1
         assert [item["label"] for item in snapshot["selections"]] == ["A", "B", "C"]
-        # This check covers citation/archive plumbing independently of the
-        # public beta's narrow default sharing scope. The app self-check opts
-        # this fixture into document scope explicitly below.
-        assert call("reading_status")["scope"] == "document"
-        quote = call("cite_passage", snapshot_id=snapshot["snapshot_id"], page_index=0, quote="Let H be a Hermitian operator")
+        assert snapshot["connection_policy"]["citation_mode"] == "selected_passages"
+        quote = call("cite_passage", snapshot_id=snapshot["snapshot_id"],
+                     selection_context_id=snapshot["selections"][0]["context_id"])
         call("save_discussion", snapshot_id=snapshot["snapshot_id"], question="Transport wrapper is not the user question",
              answer=answer, source_context_ids=[snapshot["selections"][0]["context_id"]],
              citations=[dict(context_id=quote["citation_id"], label="1")], idempotency_key="synthetic")
 
     paperdesk(connector, check_original)
 
-emit(type="step_start", sessionID=session, part=dict(type="step-start"))
 emit(type="text", sessionID=session, part=dict(id="text-1", type="text", text=answer, sessionID=session))
 emit(type="step_finish", sessionID=session, part=dict(type="step-finish", reason="stop"))
 '''

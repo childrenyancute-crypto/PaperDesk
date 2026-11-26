@@ -23,8 +23,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>PaperDesk</string>
 <key>CFBundleIconFile</key><string>PaperDesk.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.7.4</string>
-<key>CFBundleVersion</key><string>26</string>
+<key>CFBundleShortVersionString</key><string>0.7.8</string>
+<key>CFBundleVersion</key><string>30</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>

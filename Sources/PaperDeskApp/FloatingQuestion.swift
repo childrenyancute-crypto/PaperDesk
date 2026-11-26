@@ -7,9 +7,13 @@ private final class FloatingQuestionButtonState: ObservableObject {
     @Published var targetError: String?
     @Published var bubbleOffset = CGSize.zero
     @Published var bubbleDragStart: CGSize?
+    // A native Button should win a click, while a drag that starts on the
+    // same bubble must not trigger that Button when the pointer is released.
+    var bubbleDidMove = false
     @Published var panelCenter: CGPoint?
     @Published var panelDragStart: CGPoint?
     @Published var panelSize = CGSize.zero
+    @Published var panelContentHeight: CGFloat = 0
 }
 
 private struct FloatingPanelSizeKey: PreferenceKey {
@@ -19,11 +23,61 @@ private struct FloatingPanelSizeKey: PreferenceKey {
     }
 }
 
+private struct FloatingQuestionContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private final class FloatingQuestionPopoverState: ObservableObject {
     @Published var draft = ""
     @Published var selectedTargetID = ""
     @Published var externalSessionID = ""
     @Published var localError: String?
+}
+
+/// Shared progress row used by the floating composer and the Reading panel.
+/// The process owns the stage and detail text, so every harness gets the same
+/// presentation as soon as it reports progress through PaperQuestions.
+struct PaperQuestionProgressStatus: View {
+    let progress: PaperQuestionProgress
+    var compact = false
+    let onStop: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: compact ? 7 : 9) {
+            ProgressView()
+                .controlSize(compact ? .mini : .small)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(progress.title)
+                    .font(compact ? InspectorText.detailStrong : InspectorText.labelStrong)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail = progress.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(InspectorText.detail)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(spacing: 4) {
+                    Text(L("本阶段已用时", "Time in this stage"))
+                    Text(progress.startedAt, style: .timer)
+                        .monospacedDigit()
+                }
+                .font(InspectorText.detail)
+                .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+            Button(L("停止等待", "Stop waiting"), action: onStop)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help(L("停止后会保留草稿。", "Stopping keeps your draft."))
+        }
+        .padding(compact ? 7 : 9)
+        .background(ReaderPalette.softAction, in: RoundedRectangle(cornerRadius: 7))
+        .accessibilityElement(children: .contain)
+    }
 }
 
 struct FloatingQuestionButton: View {
@@ -68,6 +122,7 @@ struct FloatingQuestionButton: View {
             form.panelCenter = nil
             form.panelDragStart = nil
             form.panelSize = .zero
+            form.panelContentHeight = 0
         }
         .onChange(of: connectionSignature) { _, _ in refreshTargetsIfPresented() }
         .onChange(of: detectedProcessSignature) { _, _ in refreshTargetsIfPresented() }
@@ -77,40 +132,46 @@ struct FloatingQuestionButton: View {
 
     @ViewBuilder
     private var askButton: some View {
-        Image(systemName: isRunning ? "hourglass" : "text.bubble")
-            .font(.system(size: 15, weight: .semibold))
-            .symbolEffect(.pulse, isActive: isRunning)
-            .foregroundStyle(ReaderPalette.action)
-            .frame(width: askDiameter, height: askDiameter)
-            .background(ReaderPalette.surface, in: Circle())
-            .overlay { Circle().stroke(ReaderPalette.action.opacity(0.32), lineWidth: 0.8) }
-            .shadow(color: .black.opacity(0.14), radius: 6, y: 2)
-            .contentShape(Circle())
-            .help(L("询问当前文献"))
-            .accessibilityLabel(L("询问当前文献"))
-            .accessibilityAddTraits(.isButton)
-            .onTapGesture { toggleComposer() }
+        Button {
+            performBubbleAction { toggleComposer() }
+        } label: {
+            Image(systemName: isRunning ? "hourglass" : "text.bubble")
+                .font(.system(size: 15, weight: .semibold))
+                .symbolEffect(.pulse, isActive: isRunning)
+                .foregroundStyle(ReaderPalette.action)
+                .frame(width: askDiameter, height: askDiameter)
+                .background(ReaderPalette.surface, in: Circle())
+                .overlay { Circle().stroke(ReaderPalette.action.opacity(0.32), lineWidth: 0.8) }
+                .shadow(color: .black.opacity(0.14), radius: 6, y: 2)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(L("询问当前文献"))
+        .accessibilityLabel(L("询问当前文献"))
     }
 
     @ViewBuilder
     private var completedButton: some View {
         if let completedConversationID {
-            Image(systemName: "checkmark.bubble.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(ReaderPalette.ready)
-                .frame(width: doneDiameter, height: doneDiameter)
-                .background(ReaderPalette.surface, in: Circle())
-                .overlay { Circle().stroke(ReaderPalette.ready.opacity(0.35), lineWidth: 0.8) }
-                .shadow(color: .black.opacity(0.14), radius: 6, y: 2)
-                .contentShape(Circle())
-                .help(L("打开刚完成的阅读问答"))
-                .accessibilityLabel(L("打开刚完成的阅读问答"))
-                .accessibilityAddTraits(.isButton)
-                .onTapGesture {
+            Button {
+                performBubbleAction {
                     model.activeReadingConversationID = completedConversationID
                     if let paperID { questions.acknowledge(paperID: paperID) }
                     onOpenHistory()
                 }
+            } label: {
+                Image(systemName: "checkmark.bubble.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(ReaderPalette.ready)
+                    .frame(width: doneDiameter, height: doneDiameter)
+                    .background(ReaderPalette.surface, in: Circle())
+                    .overlay { Circle().stroke(ReaderPalette.ready.opacity(0.35), lineWidth: 0.8) }
+                    .shadow(color: .black.opacity(0.14), radius: 6, y: 2)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help(L("打开刚完成的阅读问答"))
+            .accessibilityLabel(L("打开刚完成的阅读问答"))
         }
     }
 
@@ -120,8 +181,10 @@ struct FloatingQuestionButton: View {
             completedButton
             askButton
         }
+        // Buttons keep their native click behavior; the simultaneous drag
+        // only takes over once the pointer has moved beyond the drag threshold.
+        .simultaneousGesture(bubbleDragGesture(bounds: bounds, groupSize: groupSize))
         .position(bubbleCenter(bounds: bounds, groupSize: groupSize))
-        .gesture(bubbleDragGesture(bounds: bounds, groupSize: groupSize))
     }
 
     private var controlsSize: CGSize {
@@ -136,6 +199,8 @@ struct FloatingQuestionButton: View {
         // when the window is too short for the complete composer.
         let handleHeight: CGFloat = 28
         let maxContentHeight = max(1, bounds.height - 16 - handleHeight)
+        let measuredContentHeight = form.panelContentHeight > 0 ? form.panelContentHeight : 340
+        let contentHeight = min(maxContentHeight, measuredContentHeight)
         return VStack(spacing: 0) {
             panelDragHandle(bounds: bounds, width: width)
             ScrollView(.vertical) {
@@ -149,7 +214,12 @@ struct FloatingQuestionButton: View {
                     onRefreshTargets: refreshTargets
                 )
             }
-            .frame(maxHeight: maxContentHeight)
+            .frame(height: max(1, contentHeight))
+            .onPreferenceChange(FloatingQuestionContentHeightKey.self) { height in
+                guard height.isFinite, height > 0,
+                      abs(height - form.panelContentHeight) > 0.5 else { return }
+                form.panelContentHeight = height
+            }
         }
         .frame(width: width)
         .background(ReaderPalette.inspector)
@@ -169,7 +239,6 @@ struct FloatingQuestionButton: View {
             form.panelSize = size
         }
         .position(panelCenter(bounds: bounds, width: width))
-        .opacity(form.panelSize == .zero ? 0 : 1)
     }
 
     private var connectionSignature: [String] {
@@ -194,6 +263,7 @@ struct FloatingQuestionButton: View {
                 form.isPresented = false
                 form.panelCenter = nil
                 form.panelSize = .zero
+                form.panelContentHeight = 0
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 10, weight: .semibold))
@@ -218,13 +288,25 @@ struct FloatingQuestionButton: View {
             form.isPresented = false
             form.panelCenter = nil
             form.panelSize = .zero
+            form.panelContentHeight = 0
             return
         }
         form.targetError = nil
         refreshTargets()
         form.panelCenter = nil
         form.panelSize = .zero
+        form.panelContentHeight = 0
         form.isPresented = true
+    }
+
+    private func performBubbleAction(_ action: () -> Void) {
+        guard !form.bubbleDidMove else {
+            // A drag can share the same hit region as a Button. Consume the
+            // release after a drag, then let the next click activate normally.
+            form.bubbleDidMove = false
+            return
+        }
+        action()
     }
 
     private func refreshTargets() {
@@ -265,7 +347,10 @@ struct FloatingQuestionButton: View {
     private func bubbleDragGesture(bounds: CGSize, groupSize: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 4, coordinateSpace: .named(Self.dragCoordinateSpace))
             .onChanged { value in
-                if form.bubbleDragStart == nil { form.bubbleDragStart = form.bubbleOffset }
+                if form.bubbleDragStart == nil {
+                    form.bubbleDragStart = form.bubbleOffset
+                }
+                form.bubbleDidMove = true
                 let start = form.bubbleDragStart ?? .zero
                 form.bubbleOffset = clampedBubbleOffset(
                     CGSize(width: start.width + value.translation.width,
@@ -273,7 +358,17 @@ struct FloatingQuestionButton: View {
                     bounds: bounds, groupSize: groupSize
                 )
             }
-            .onEnded { _ in form.bubbleDragStart = nil }
+            .onEnded { _ in
+                form.bubbleDragStart = nil
+                if form.bubbleDidMove {
+                    // Leave the suppression flag set through the current
+                    // gesture's Button release, then clear it before the next
+                    // user interaction.
+                    DispatchQueue.main.async {
+                        form.bubbleDidMove = false
+                    }
+                }
+            }
     }
 
     private func defaultPanelCenter(bounds: CGSize, width: CGFloat) -> CGPoint {
@@ -340,6 +435,10 @@ private struct FloatingQuestionPopover: View {
 
     private var draft: String { form.draft }
     private var externalSessionID: String { form.externalSessionID }
+    private var storedDraft: String {
+        guard let paperID = draftPaperID else { return "" }
+        return questions.drafts[paperID] ?? ""
+    }
 
     private var choices: [PaperQuestionTarget] { targets?.choices ?? [] }
     private var activeTarget: PaperQuestionTarget? { targets?.active }
@@ -382,16 +481,32 @@ private struct FloatingQuestionPopover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             recipient
+            if let draftPaperID, let progress = questions.progressByPaperID[draftPaperID] {
+                PaperQuestionProgressStatus(progress: progress, compact: true) {
+                    questions.cancel(paperID: draftPaperID)
+                }
+            }
             selectionChips
             editor
             footer
         }
         .padding(16)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: FloatingQuestionContentHeightKey.self, value: proxy.size.height)
+            }
+        }
         .background(ReaderPalette.inspector)
         .onAppear { loadDraftAndSelection() }
         .onChange(of: draft) { _, value in
             guard let paperID = draftPaperID else { return }
             questions.drafts[paperID] = value
+        }
+        .onChange(of: storedDraft) { previous, current in
+            let sentDraft = previous.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard current.isEmpty, !sentDraft.isEmpty,
+                  draft.trimmingCharacters(in: .whitespacesAndNewlines) == sentDraft else { return }
+            form.draft = ""
         }
         .onChange(of: form.selectedTargetID) { _, _ in
             // A session ID belongs to one target. Never carry a pasted ID to
@@ -537,8 +652,8 @@ private struct FloatingQuestionPopover: View {
             TextEditor(text: $form.draft)
                 .font(InspectorText.body)
                 .scrollContentBackground(.hidden)
-                .frame(minHeight: 148, maxHeight: 260)
                 .padding(6)
+                .frame(height: 200)
                 .background(ReaderPalette.surface, in: RoundedRectangle(cornerRadius: 7))
                 .overlay {
                     RoundedRectangle(cornerRadius: 7)
@@ -574,14 +689,17 @@ private struct FloatingQuestionPopover: View {
                         .font(InspectorText.detail)
                         .help(L("清空续问目标，下次改为新建对话"))
                 }
-                Button(L("取消")) { isPresented = false }
+                Button(L("关闭", "Close")) { isPresented = false }
                     .buttonStyle(.borderless)
                     .keyboardShortcut(.cancelAction)
-                Button(L("发送")) { send() }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(!canSend)
+                Button(action: send) {
+                    Text(L("发送"))
+                        .frame(minWidth: 64, minHeight: 24)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(!canSend)
             }
         }
     }
@@ -646,7 +764,6 @@ private struct FloatingQuestionPopover: View {
             resolvedTarget = target
         }
 
-        guard questions.send(text, to: resolvedTarget, in: model) else { return }
-        isPresented = false
+        questions.send(text, to: resolvedTarget, in: model)
     }
 }

@@ -147,6 +147,44 @@ final class StorageTests: XCTestCase {
         XCTAssertEqual(try store.snapshotCitations(snapshotID: snapshot.id).count, 2)
     }
 
+    func testReadingFeedbackLinksLatestAnswerAndPersistsAnswerMode() throws {
+        let source = try makePDF(named: "feedback.pdf")
+        let store = try LibraryStore(rootURL: temporaryDirectory.appendingPathComponent("library", isDirectory: true))
+        let paper = try store.importPDF(from: source, title: "Feedback", pageCount: 1)
+        let snapshot = ReadingQuestionSnapshot(state: PaperReadingState(paperID: paper.id, documentHash: paper.fileHash))
+        try store.freezeReadingState(snapshot)
+        let origin = RecordOrigin(clientName: "Codex", clientVersion: "1")
+
+        let first = try store.appendDiscussion(paperID: paper.id, snapshotID: snapshot.id,
+                                               question: "Why does this follow?", answer: "Because of the premise.",
+                                               sourceContextIDs: [], idempotencyKey: "feedback-first", origin: origin,
+                                               conversationID: "feedback-thread", answerMode: .direct)
+        let second = try store.appendDiscussion(paperID: paper.id, snapshotID: snapshot.id,
+                                                question: "A related question", answer: "Here is a related answer.",
+                                                sourceContextIDs: [], idempotencyKey: "feedback-second", origin: origin,
+                                                conversationID: "new-thread", continuingFrom: first.id)
+
+        XCTAssertThrowsError(try store.appendDiscussion(paperID: paper.id, snapshotID: snapshot.id,
+                                                        question: "I still don't understand this.", answer: "Let's revisit it.",
+                                                        sourceContextIDs: [], idempotencyKey: "feedback-stale", origin: origin,
+                                                        conversationID: "other-thread", continuingFrom: first.id,
+                                                        feedbackKind: .unclear, feedbackEvidence: "don't understand",
+                                                        answerMode: .selfReview))
+
+        let followUp = try store.appendDiscussion(paperID: paper.id, snapshotID: snapshot.id,
+                                                  question: "I still don't understand this.", answer: "Let's revisit it.",
+                                                  sourceContextIDs: [], idempotencyKey: "feedback-valid", origin: origin,
+                                                  conversationID: "another-thread", continuingFrom: second.id,
+                                                  feedbackKind: .unclear, feedbackEvidence: "don't understand",
+                                                  answerMode: .selfReview)
+        let session = try store.chatSession(paperID: paper.id)
+        let answerIndex = try XCTUnwrap(session.messages.firstIndex(where: { $0.id == followUp.id }))
+        XCTAssertGreaterThan(answerIndex, 0)
+        let question = session.messages[answerIndex - 1]
+        XCTAssertEqual(question.readingFeedback, ReadingFeedback(kind: .unclear, evidence: "don't understand", answerID: second.id))
+        XCTAssertEqual(session.messages.first(where: { $0.id == followUp.id })?.answerMode, ReadingAnswerMode.selfReview)
+    }
+
     private func makePDF(named name: String) throws -> URL {
         let url = temporaryDirectory.appendingPathComponent(name)
         let data = Data("%PDF-1.7\n% PaperDesk test fixture\n".utf8)

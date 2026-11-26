@@ -7,10 +7,19 @@ import PaperDeskBridge
 
 @main
 enum Launcher {
-    static let version = "0.7.4"
+    static let version = "0.7.8"
 
     @MainActor
     static func main() {
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--check-live-question" {
+            let client = CommandLine.arguments[2]
+            Task {
+                do { try await ReaderSelfCheck.checkLiveQuestion(clientID: client); exit(0) }
+                catch { print("Live question failed: \(error.localizedDescription)"); exit(1) }
+            }
+            RunLoop.main.run()
+            return
+        }
         if CommandLine.arguments.contains("--check-floating-question") {
             Task {
                 do { try await ReaderSelfCheck.checkFloatingQuestion(); exit(0) }
@@ -18,6 +27,10 @@ enum Launcher {
             }
             RunLoop.main.run()
             return
+        }
+        if CommandLine.arguments.contains("--check-question-bubble") {
+            do { try ReaderSelfCheck.checkQuestionBubble(); exit(0) }
+            catch { FileHandle.standardError.write(Data("PaperDesk bubble check failed: \(error.localizedDescription)\n".utf8)); exit(1) }
         }
         if let option = CommandLine.arguments.firstIndex(of: "--serve-project-check"),
            CommandLine.arguments.indices.contains(option + 1) {
@@ -38,6 +51,7 @@ enum Launcher {
                 try ReaderSelfCheck.checkChatStorage()
                 try ReaderSelfCheck.checkExtractiveStorage()
                 try ReaderSelfCheck.checkReadingState()
+                try ReaderSelfCheck.checkReferenceRendering()
                 try ReaderSelfCheck.checkMathFonts()
                 exit(0)
             }
@@ -72,7 +86,7 @@ final class AppRuntime: ObservableObject {
             }
             let service = ReaderTools(model: model)
             let server = LocalBridgeServer(socketURL: LibraryPaths.socket(root: root)) { request in
-                await MainActor.run { service.handle(request) }
+                await service.handleWithProgress(request)
             }
             self.model = model
             self.startupError = nil
@@ -122,6 +136,15 @@ struct PaperDeskApplication: App {
                         .credits: NSAttributedString(string: L("本地文献阅读、批注与笔记。可接入本地 MCP 客户端。"))
                     ])
                 }
+            }
+        }
+        Settings {
+            if let model = runtime.model {
+                ConnectionPolicyControls(model: model)
+                    .padding(24)
+                    .frame(width: 510, alignment: .leading)
+                    .font(InspectorText.body)
+                    .id(language)
             }
         }
     }

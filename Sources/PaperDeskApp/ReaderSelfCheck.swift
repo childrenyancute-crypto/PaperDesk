@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import ImageIO
 import PDFKit
@@ -28,11 +29,15 @@ enum ReaderSelfCheck {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let source = directory.appendingPathComponent("Synthetic quantum reading sample.pdf")
         try SamplePDF.create(at: source)
-        let model = try AppModel(store: LibraryStore(rootURL: directory.appendingPathComponent("library")))
-        model.openPDF(url: source)
-        guard model.scope == .selection else {
-            throw PaperDeskError.invalid("新打开的文献默认没有限制在固定选区。")
+        guard let preferences = UserDefaults(suiteName: "paperdesk.selfcheck." + directory.lastPathComponent) else {
+            throw PaperDeskError.invalid("无法打开自检设置。")
         }
+        let model = try AppModel(store: LibraryStore(rootURL: directory.appendingPathComponent("library")), preferences: preferences)
+        model.openPDF(url: source)
+        guard model.scope == .document else {
+            throw PaperDeskError.invalid("新打开的文献未默认允许读取全文。")
+        }
+        model.scope = .selection
         guard let paper = model.selectedPaper, let pdf = model.document,
               let assumptions = pdf.findString("For a time-independent Hamiltonian", withOptions: []).first else {
             throw PaperDeskError.invalid("测试 PDF 的条件段落无法定位。")
@@ -68,6 +73,222 @@ enum ReaderSelfCheck {
         RunLoop.main.run()
     }
 
+    static func checkReferenceRendering() throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/pdr-" + String(UUID().uuidString.prefix(8)))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (model, paper) = try projectFixture(at: directory)
+        model.clearSelections()
+        model.scope = .document
+        let bibliography = [
+            PaperReferenceDraft(label: "7", entryIndex: 0, authors: "Smith, J.", firstAuthor: "Smith",
+                                title: "A verified earlier result", year: 2020, venue: "Journal of Examples",
+                                doi: nil, arxivID: nil, url: nil, rawText: "[7] Smith, J. (2020). A verified earlier result.",
+                                pageIndex: 1, pageLabel: "2", fingerprint: "self-check-reference-7"),
+            PaperReferenceDraft(label: "8", entryIndex: 1, authors: "Doe, A.", firstAuthor: "Doe",
+                                title: "A second result", year: 2021, venue: "Journal of Examples",
+                                doi: nil, arxivID: nil, url: nil, rawText: "[8] Doe, A. (2021). A second result.",
+                                pageIndex: 1, pageLabel: "2", fingerprint: "self-check-reference-8")
+        ]
+        try model.store.replacePDFBibliography(paperID: paper.id, entries: bibliography,
+                                                headingPageIndex: 1, parserVersion: PaperReferenceParser.version)
+        model.refreshReferences()
+        let groupedReferences = PaperReferenceMentions.snapshots(
+            in: "Prior work [7, 8] and [7–8] support the setup. Array a[8] and code `[7]` remain ordinary text.",
+            references: model.references)
+        guard Set(groupedReferences.map(\.label)) == Set(["7", "8"]) else {
+            throw PaperDeskError.invalid("合并参考文献编号或代码中的方括号识别有误。")
+        }
+        let reader = ReaderTools(model: model)
+        func call(_ method: String, _ arguments: [String: JSONValue] = [:]) throws -> JSONValue {
+            let result = reader.handle(BridgeRequest(method: method, arguments: .object(arguments))).result
+            guard result?["isError"].boolValue == false, let body = result?["structuredContent"] else {
+                throw PaperDeskError.invalid("引用自检调用失败：\(method)")
+            }
+            return body
+        }
+        let input = "公式 $x_1$ 中，原文写道“Let H be a Hermitian operator”，并引用文献 [7]。\n另有 10.1000/182。\n“这段虚构文字不能生成标记”。\n源码样例 `“这条代码里的假引文不能生成标记”`。\n文献 [999] 尚未匹配。"
+        guard let snapshotID = try call("capture_reading_state")["snapshot_id"].stringValue else {
+            throw PaperDeskError.invalid("缺少引用自检快照。")
+        }
+        var arguments: [String: JSONValue] = [
+            "snapshot_id": .string(snapshotID), "question": .string("请对照原文。"), "answer": .string(input),
+            "source_context_ids": .array([]), "idempotency_key": .string("reference-rendering")
+        ]
+        let saved = try call("save_discussion", arguments)
+        let expected = input
+            .replacingOccurrences(of: "operator”", with: "operator”⟦1⟧")
+            .replacingOccurrences(of: "10.1000/182", with: "[10.1000/182](https://doi.org/10.1000/182)")
+        guard saved["rendered_answer"].stringValue == expected,
+              let message = model.discussion.last, message.text == expected,
+              message.citations?.count == 1,
+              message.referencedWorks?.map(\.label) == ["7"],
+              message.referencedWorks?.first?.title == "A verified earlier result",
+              message.citationWarnings?.contains(where: { $0.contains("[999]") }) == true else {
+            throw PaperDeskError.invalid("引用渲染改变了正文或没有补齐可验证的引用。")
+        }
+        let savedMessageID = message.id
+        model.activateCitations(for: message)
+        guard model.activeCitationMarks.contains(where: { $0.regions.contains { $0.pageIndex == 0 } }),
+              try model.store.snapshotCitations(snapshotID: snapshotID).count == 1 else {
+            throw PaperDeskError.invalid("引用渲染没有保存跨页位置。")
+        }
+        try model.store.replacePDFBibliography(paperID: paper.id,
+                                                entries: [PaperReferenceDraft(label: "7", entryIndex: 0,
+                                                                               authors: "Other, A.", firstAuthor: "Other",
+                                                                               title: "A changed directory entry", year: 2030,
+                                                                               venue: nil, doi: nil, arxivID: nil, url: nil,
+                                                                               rawText: "[7] Other, A. (2030). A changed directory entry.",
+                                                                               pageIndex: 1, pageLabel: "2", fingerprint: "self-check-reference-7-updated")],
+                                                headingPageIndex: 1, parserVersion: PaperReferenceParser.version)
+        model.refreshReferences()
+        guard model.discussion.first(where: { $0.id == savedMessageID })?.referencedWorks?.first?.title == "A verified earlier result" else {
+            throw PaperDeskError.invalid("重建目录后，旧回答的参考文献链接发生变化。")
+        }
+        arguments["render_references"] = .bool(false)
+        arguments["idempotency_key"] = .string("reference-rendering-disabled")
+        guard try call("save_discussion", arguments)["rendered_answer"] == .null,
+              model.discussion.last?.text == input,
+              model.discussion.last?.referencedWorks?.isEmpty == true,
+              model.scope(forPaperID: paper.id) == .document else {
+            throw PaperDeskError.invalid("关闭引用渲染后仍修改了答案。")
+        }
+        var longAnswerArguments = arguments
+        longAnswerArguments["render_references"] = .bool(true)
+        longAnswerArguments["answer"] = .string("第一段说明一个结果。\n\n第二段解释这个结果。\n\n第三段继续讨论条件。")
+        longAnswerArguments["idempotency_key"] = .string("long-answer-without-citations")
+        let longAnswer = try call("save_discussion", longAnswerArguments)
+        guard longAnswer["citation_warnings"].arrayValue?.contains(where: { $0.stringValue?.contains("漏标") == true }) == true,
+              model.discussion.last?.citationWarnings?.isEmpty == false else {
+            throw PaperDeskError.invalid("长回答缺少原文标记时没有显示核对提示。")
+        }
+
+        model.clearSelections()
+        guard let document = model.document,
+              let firstPassage = document.findString("Let H be a Hermitian operator", withOptions: []).first,
+              let secondPassage = document.findString("For a time-independent Hamiltonian", withOptions: []).first else {
+            throw PaperDeskError.invalid("无法准备正文引用顺序测试。")
+        }
+        model.captureSelection(firstPassage, document: document)
+        model.captureSelection(secondPassage, document: document)
+        guard let orderSnapshotID = try call("capture_reading_state")["snapshot_id"].stringValue,
+              let snapshot = try model.store.readingSnapshot(id: orderSnapshotID),
+              snapshot.state.selections.count == 2 else {
+            throw PaperDeskError.invalid("正文引用顺序测试缺少两处选区。")
+        }
+        var orderCitations: [[String: JSONValue]] = []
+        for selection in snapshot.state.selections {
+            let created = try call("cite_passage", ["snapshot_id": .string(orderSnapshotID),
+                                                       "selection_context_id": .string(selection.id)])
+            guard let contextID = created["citation_id"].stringValue,
+                  let label = created["label"].stringValue else {
+                throw PaperDeskError.invalid("无法创建正文引用顺序测试出处。")
+            }
+            orderCitations.append(["context_id": .string(contextID), "label": .string(label)])
+        }
+        let outOfOrderAnswer = "先解释第二处原文⟦2⟧，再回到第一处原文⟦1⟧。"
+        let normalizedOrder = try call("save_discussion", [
+            "snapshot_id": .string(orderSnapshotID), "question": .string("检查引用编号顺序。"),
+            "answer": .string(outOfOrderAnswer), "source_context_ids": .array([]),
+            "citations": .array(orderCitations.map(JSONValue.object)),
+            "idempotency_key": .string("citation-order-normalization")
+        ])
+        let expectedOrder = "先解释第二处原文⟦1⟧，再回到第一处原文⟦2⟧。"
+        guard normalizedOrder["rendered_answer"].stringValue == expectedOrder,
+              model.discussion.last?.citations?.map(\.label) == ["1", "2"],
+              model.discussion.last?.citationWarnings?.contains(where: { $0.contains("正文首次出现顺序") }) == true else {
+            throw PaperDeskError.invalid("正文引用没有按首次出现顺序整理并提示核对。")
+        }
+
+        model.clearSelections()
+        guard let capacitySnapshotID = try call("capture_reading_state")["snapshot_id"].stringValue else {
+            throw PaperDeskError.invalid("缺少 32 处引用上限测试快照。")
+        }
+        var capacityCitations: [[String: JSONValue]] = []
+        for index in 0..<32 {
+            let region: JSONValue = .object([
+                "x": .number(24), "y": .number(Double(24 + index * 12)),
+                "width": .number(8), "height": .number(8)
+            ])
+            let created = try call("cite_passage", ["snapshot_id": .string(capacitySnapshotID),
+                                                       "page_index": .number(0), "region": region])
+            guard let contextID = created["citation_id"].stringValue,
+                  let label = created["label"].stringValue else {
+                throw PaperDeskError.invalid("无法建立第 \(index + 1) 个测试出处。")
+            }
+            capacityCitations.append(["context_id": .string(contextID), "label": .string(label)])
+        }
+        let overflowRequest = BridgeRequest(method: "cite_passage", arguments: .object([
+            "snapshot_id": .string(capacitySnapshotID), "page_index": .number(0),
+            "region": .object(["x": .number(24), "y": .number(420), "width": .number(8), "height": .number(8)])
+        ]))
+        guard reader.handle(overflowRequest).result?["isError"].boolValue == true else {
+            throw PaperDeskError.invalid("第 33 处原文引用没有遵守容量限制。")
+        }
+        let capacityAnswer = (1...32).map { "结论 \($0)⟦\($0)⟧" }.joined(separator: "，")
+        _ = try call("save_discussion", [
+            "snapshot_id": .string(capacitySnapshotID), "question": .string("检查长回答引用上限。"),
+            "answer": .string(capacityAnswer), "source_context_ids": .array([]),
+            "citations": .array(capacityCitations.map { JSONValue.object($0) }),
+            "idempotency_key": .string("citation-capacity-32")
+        ])
+        guard model.discussion.last?.citations?.count == 32 else {
+            throw PaperDeskError.invalid("32 处可跳转原文不能完整归档。")
+        }
+        print("PASS: mixed citations remain linked, warnings persist, history stays fixed, footnotes follow text order, and 32 source marks save")
+    }
+
+    static func checkLiveQuestion(clientID: String) async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/pdl-" + String(UUID().uuidString.prefix(8)))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (model, paper) = try projectFixture(at: directory)
+        model.scope = .document
+        model.clearSelections()
+        try model.prepareQuestionProject()
+        let service = ReaderTools(model: model)
+        let server = LocalBridgeServer(socketURL: LibraryPaths.socket(root: model.store.rootURL)) { request in
+            await service.handleWithProgress(request)
+        }
+        try server.start()
+        defer { server.stop() }
+        model.bridgeConnected = true
+        model.recordClientConnection(connectionID: "live-check", paperID: paper.id, documentHash: paper.fileHash,
+                                     clientName: clientID, clientVersion: nil)
+        guard let target = try model.questionTargets().choices.first(where: { $0.clientID == clientID }) else {
+            throw PaperDeskError.missing("无法启动指定的测试客户端。")
+        }
+        let start = Date()
+        var previous: PaperQuestionStage?
+        let observer = model.questions.$progressByPaperID.sink { values in
+            if let stage = values[paper.id]?.stage, stage != previous {
+                previous = stage
+                print(String(format: "%.2fs", Date().timeIntervalSince(start)), stage)
+                fflush(stdout)
+            }
+        }
+        defer { observer.cancel() }
+        guard model.questions.send("This is a synthetic PDF test. Read PDF page 1 (index 0), even if the reader is on page 2. Quote the short passage ‘Let H be a Hermitian operator’ exactly, use cite_passage to make the reader highlight it, and attach the returned citation when saving the answer. One sentence only.", to: target, in: model) else {
+            throw PaperDeskError.invalid(model.questions.errors[paper.id] ?? "未能发送测试。")
+        }
+        let end = start.addingTimeInterval(180)
+        while model.questions.runningPaperIDs.contains(paper.id), Date() < end {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        if model.questions.runningPaperIDs.contains(paper.id) {
+            model.questions.cancel(paperID: paper.id)
+            throw PaperDeskError.invalid("客户端测试超时。")
+        }
+        if let error = model.questions.errors[paper.id] { throw PaperDeskError.invalid(error) }
+        guard let answer = model.discussion.last, answer.role == .assistant,
+              answer.citations?.first != nil else {
+            throw PaperDeskError.invalid(model.questions.errors[paper.id] ?? "客户端回答未带有已保存的原文高亮。")
+        }
+        model.activateCitations(for: answer)
+        guard model.activeCitationMarks.contains(where: { $0.regions.contains { $0.pageIndex == 0 } }) else {
+            throw PaperDeskError.invalid("阅读器没有取得跨页高亮位置。")
+        }
+        print("PASS: \(clientID) saved a verified cross-page PDF highlight")
+    }
+
     static func checkFloatingQuestion() async throws {
         guard let fixture = ProcessInfo.processInfo.environment["PAPERDESK_QUESTION_TEST_CLIENTS"],
               let fixtureDirectory = QuestionClientRegistry.adapter(id: "codex")?.executableURL()?.deletingLastPathComponent(),
@@ -78,11 +299,6 @@ enum ReaderSelfCheck {
         let directory = URL(fileURLWithPath: "/private/tmp/pdq-" + String(UUID().uuidString.prefix(8)))
         defer { try? FileManager.default.removeItem(at: directory) }
         let (model, paper) = try projectFixture(at: directory)
-        // This test exercises floating-question snapshots, citations and
-        // conversation archival. Opt its fixture into broad access explicitly
-        // so the public default of selection-only sharing remains covered by
-        // the context and page-scope checks elsewhere in this self-check.
-        model.scope = .document
         try model.prepareQuestionProject()
         let noConnections = try model.questionTargets()
         guard noConnections.choices.isEmpty, noConnections.active == nil, noConnections.hasProject else {
@@ -106,7 +322,7 @@ enum ReaderSelfCheck {
         markConnected()
         let service = ReaderTools(model: model)
         let server = LocalBridgeServer(socketURL: LibraryPaths.socket(root: model.store.rootURL)) { request in
-            await MainActor.run { service.handle(request) }
+            await service.handleWithProgress(request)
         }
         try server.start()
         defer { server.stop() }
@@ -117,22 +333,65 @@ enum ReaderSelfCheck {
             while model.questions.runningPaperIDs.contains(paper.id), Date() < deadline {
                 try await Task.sleep(for: .milliseconds(50))
             }
-            guard !model.questions.runningPaperIDs.contains(paper.id) else { throw PaperDeskError.invalid("合成客户端没有及时回答。") }
+            if let progress = model.questions.progressByPaperID[paper.id] {
+                throw PaperDeskError.invalid("合成客户端没有及时回答（\(progress.title) · \(model.questions.drafts[paper.id] ?? "无草稿")）。")
+            }
         }
 
         let originalIDs = model.activeSelections.map(\.id)
         let initial = try model.questionTargets()
+        var stages: [PaperQuestionStage] = []
+        let observation = model.questions.$progressByPaperID.sink { values in
+            guard let stage = values[paper.id]?.stage, stages.last != stage else { return }
+            stages.append(stage)
+        }
+        defer { observation.cancel() }
+        let waitingQuestion = "First frozen question"
+        guard let waitingTarget = initial.choices.first(where: { $0.clientID == "codex" && !$0.isKnownConversation }),
+              model.questions.send(waitingQuestion, to: waitingTarget, in: model) else {
+            throw PaperDeskError.invalid("无法启动等待中的 Codex 自检请求。")
+        }
+        let waitingFile = fixtureDirectory.appendingPathComponent("codex-waiting")
+        let startDeadline = Date().addingTimeInterval(3)
+        while (!FileManager.default.fileExists(atPath: waitingFile.path) || stages.last != .generatingAnswer),
+              Date() < startDeadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        guard FileManager.default.fileExists(atPath: waitingFile.path),
+              model.questions.runningPaperIDs.contains(paper.id),
+              stages == [.checkingConnection, .connectingClient, .waitingForAnswer, .generatingAnswer] else {
+            throw PaperDeskError.invalid(model.questions.errors[paper.id] ?? "合成 Codex 客户端阶段不正确 \(stages)。")
+        }
+        model.questions.cancel(paperID: paper.id)
+        guard !model.questions.runningPaperIDs.contains(paper.id),
+              model.questions.progressByPaperID[paper.id] == nil,
+              let retryDraft = model.questions.drafts[paper.id], retryDraft == waitingQuestion,
+              model.discussion.isEmpty else {
+            throw PaperDeskError.invalid("停止等待后没有解锁发送、保留草稿或保持对话记录。")
+        }
+        stages.removeAll()
         guard initial.active == nil,
               initial.connectedClients.contains(where: { $0.clientName == "future-harness" && $0.clientID == nil }),
               initial.choices.allSatisfy({ ["codex", "opencode"].contains($0.clientID) }),
               let create = initial.choices.first(where: { $0.clientID == "opencode" && !$0.isKnownConversation }),
-              model.questions.send("First frozen question", to: create, in: model) else {
+              model.questions.send(retryDraft, to: create, in: model) else {
             throw PaperDeskError.invalid("没有找到合成 OpenCode 客户端或无法新建对话。")
         }
         model.clearSelections()
         model.navigate(pageIndex: 2)
         try await waitForReply()
+        let titleDeadline = Date().addingTimeInterval(5)
+        while ConversationGrouping.group(model.discussion).first?.title != "OpenCode session title", Date() < titleDeadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        guard FileManager.default.fileExists(atPath: fixtureDirectory.appendingPathComponent("codex-stopped").path) else {
+            throw PaperDeskError.invalid("切换客户端后，已停止的 Codex 请求仍在运行。")
+        }
         guard model.questions.errors[paper.id] == nil, model.activeReadingConversationID == nil,
+              model.questions.progressByPaperID[paper.id] == nil,
+              stages.first == .checkingConnection, stages.contains(.connectingClient),
+              stages.contains(.readingPaper), stages.contains(.markingSources),
+              stages.contains(.savingAnswer), stages.contains(.finishing),
               let conversation = model.questions.completedConversationIDs[paper.id],
               let archived = model.discussion.last, let snapshot = archived.readingSnapshotID,
               let frozen = try model.store.readingSnapshot(id: snapshot), frozen.state.selections.map(\.id) == originalIDs,
@@ -194,6 +453,11 @@ enum ReaderSelfCheck {
         }
 
         model.activeReadingConversationID = nil
+        guard let document = model.document,
+              let selection = document.findString("Let H be a Hermitian operator", withOptions: [.literal]).first else {
+            throw PaperDeskError.invalid("未找到 Codex 的引用自检选区。")
+        }
+        model.captureSelection(selection, document: document)
         markConnected()
         let newTargets = try model.questionTargets()
         guard newTargets.active == nil,
@@ -205,7 +469,8 @@ enum ReaderSelfCheck {
         let reopened = try LibraryStore(rootURL: model.store.rootURL)
         let bindings = try reopened.questionBindings(paperID: paper.id)
         guard model.questions.errors[paper.id] == nil, Set(bindings.map(\.backend)) == ["codex", "opencode"],
-              let answer = model.discussion.last, answer.text == "Codex answer",
+              let answer = model.discussion.last, answer.text == "Codex answer ⟦1⟧",
+              answer.citations?.map(\.label) == ["1"],
               answer.origin?.clientSourceLabel == "Codex",
               ConversationGrouping.group(model.discussion).count == 3 else {
             throw PaperDeskError.invalid(model.questions.errors[paper.id] ?? "新对话与原会话的客户端绑定串组了。")
@@ -228,11 +493,89 @@ enum ReaderSelfCheck {
               Set(ConversationGrouping.group(try reopened.chatSession(paperID: paper.id).messages).map(\.title)) == expectedTitles else {
             throw PaperDeskError.invalid("外部改名没有按会话同步到阅读记录。")
         }
-        print("PASS: floating questions preserve snapshots, archive and resume independently, retain failed drafts, and mirror both clients' titles and renames")
+        print("PASS: floating questions report live phases, clear them on cancellation and completion, and preserve snapshots, archives and drafts")
     }
 
     private static func checkProjectConfiguration(_ project: URL, paper: Paper, library: URL, connector: URL) throws {
         let instructionsURL = project.appendingPathComponent("AGENTS.md")
+        let reviewerURL = project.appendingPathComponent(".codex", isDirectory: true)
+            .appendingPathComponent("agents", isDirectory: true)
+            .appendingPathComponent("paperdesk-answer-reviewer.toml")
+        let feedbackURL = reviewerURL.deletingLastPathComponent().appendingPathComponent("paperdesk-feedback-analyst.toml")
+        let codexReference = project.appendingPathComponent(".codex/agents/paperdesk-reference-renderer.toml")
+        let openCodeReference = project.appendingPathComponent(".opencode/agents/paperdesk-reference-renderer.md")
+        let currentMarker = "<!-- paperdesk:begin v10 -->"
+
+        // A new project gets both the managed instructions and the dedicated
+        // reviewer role. Keep these checks independent of any real Codex CLI.
+        let freshInstructions = try String(contentsOf: instructionsURL, encoding: .utf8)
+        let freshReviewer = try String(contentsOf: reviewerURL, encoding: .utf8)
+        let freshFeedback = try String(contentsOf: feedbackURL, encoding: .utf8)
+        guard freshInstructions.contains(currentMarker), freshInstructions.contains("<!-- paperdesk:end -->"),
+              freshInstructions.contains(CodexPaperReview.instructions),
+              freshInstructions.contains(CodexPaperFeedback.instructions),
+              freshInstructions.contains(PaperReferenceRenderer.projectInstruction),
+              try String(contentsOf: codexReference, encoding: .utf8).contains("developer_instructions"),
+              try String(contentsOf: openCodeReference, encoding: .utf8).contains("mode: subagent"),
+              freshReviewer.contains(#"name = "paperdesk-answer-reviewer""#),
+              freshFeedback.contains(#"name = "paperdesk-feedback-analyst""#),
+              freshFeedback.contains("developer_instructions") else {
+            throw PaperDeskError.invalid("新项目没有生成阅读规则、复核角色或反馈分析角色。")
+        }
+
+        for version in [4, 5, 6, 7, 8, 9] {
+            var previous = freshInstructions.replacingOccurrences(of: currentMarker, with: "<!-- paperdesk:begin v\(version) -->")
+                .replacingOccurrences(of: CodexPaperProject.referenceInstruction + "\n", with: "")
+            if version < 9 {
+                previous = previous.replacingOccurrences(of: PaperReferenceRenderer.projectInstruction + "\n", with: "")
+            }
+            if version < 8 {
+                previous = previous.replacingOccurrences(of: CodexPaperProject.currentCitationInstruction, with: CodexPaperProject.citationInstruction)
+            }
+            if version < 7 {
+                previous = previous.replacingOccurrences(of: CodexPaperFeedback.instructions + "\n", with: "")
+            }
+            if version < 6 {
+                previous = previous.replacingOccurrences(of: CodexPaperReview.instructions + "\n", with: "")
+            }
+            try previous.write(to: instructionsURL, atomically: true, encoding: .utf8)
+            try FileManager.default.removeItem(at: feedbackURL)
+            _ = try CodexPaperProject.create(paper: paper, library: library, connector: connector)
+            guard try String(contentsOf: instructionsURL, encoding: .utf8) == freshInstructions,
+                  try String(contentsOf: feedbackURL, encoding: .utf8) == freshFeedback else {
+                throw PaperDeskError.invalid("旧版阅读项目刷新后缺少反馈分析配置。")
+            }
+        }
+
+        let stableInstructions = try Data(contentsOf: instructionsURL)
+        let stableReviewer = try Data(contentsOf: reviewerURL)
+        let codexConfig = project.appendingPathComponent(".codex/config.toml")
+        let currentConfig = try String(contentsOf: codexConfig, encoding: .utf8)
+        let referenceApproval = "[mcp_servers.paperdesk.tools.verify_reference]\napproval_mode = \"approve\"\n\n"
+        guard currentConfig.contains(referenceApproval) else {
+            throw PaperDeskError.invalid("Codex 项目缺少参考文献核实工具授权。")
+        }
+        try currentConfig.replacingOccurrences(of: referenceApproval, with: "").write(to: codexConfig, atomically: true, encoding: .utf8)
+        _ = try CodexPaperProject.create(paper: paper, library: library, connector: connector)
+        guard try Data(contentsOf: instructionsURL) == stableInstructions,
+              try Data(contentsOf: reviewerURL) == stableReviewer,
+              try String(contentsOf: feedbackURL, encoding: .utf8) == freshFeedback,
+              try String(contentsOf: codexConfig, encoding: .utf8) == currentConfig else {
+            throw PaperDeskError.invalid("重复刷新项目配置时改变了稳定的生成内容。")
+        }
+
+        let customizedReviewer = """
+        # User-owned reviewer role
+        name = "paperdesk-answer-reviewer"
+        description = "Use my project-specific review preferences."
+        developer_instructions = "Keep this custom reviewer configuration."
+        """
+        try customizedReviewer.write(to: reviewerURL, atomically: true, encoding: .utf8)
+        _ = try CodexPaperProject.create(paper: paper, library: library, connector: connector)
+        guard try String(contentsOf: reviewerURL, encoding: .utf8) == customizedReviewer else {
+            throw PaperDeskError.invalid("刷新项目配置时覆盖了同名的自定义 reviewer 文件。")
+        }
+
         let originalInstructions = "# Custom project guidance\n\nKeep this text when refreshing PaperDesk.\n"
         try originalInstructions.write(to: instructionsURL, atomically: true, encoding: .utf8)
         let configURL = project.appendingPathComponent("opencode.json")
@@ -245,11 +588,12 @@ enum ReaderSelfCheck {
         let updated = try String(contentsOf: instructionsURL, encoding: .utf8)
         let config = try JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any]
         let servers = config?["mcp"] as? [String: [String: Any]]
-        guard updated.contains(originalInstructions), updated.components(separatedBy: "<!-- paperdesk:begin").count <= 2,
+        guard updated == originalInstructions,
               config?["theme"] as? String == "custom", servers?["other"]?["enabled"] as? Bool == false,
               servers?["paperdesk"]?["enabled"] as? Bool == false,
               servers?["paperdesk"]?["timeout"] as? Int == 8000,
-              (servers?["paperdesk"]?["command"] as? [String])?.first == connector.path else {
+              (servers?["paperdesk"]?["command"] as? [String])?.first == connector.path,
+              try String(contentsOf: reviewerURL, encoding: .utf8) == customizedReviewer else {
             throw PaperDeskError.invalid("刷新接入配置后，项目自定义内容未保留或出现了重复配置。")
         }
 
@@ -265,9 +609,60 @@ enum ReaderSelfCheck {
         print("PASS: project refresh preserves custom instructions and OpenCode settings")
     }
 
+    private static func checkUnnamedClient(model: AppModel, paper: Paper, service: ReaderTools) throws {
+        let launch = try model.mcpLaunchConfiguration(bound: true, clientLabel: "Codex")
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: launch.command)
+        helper.arguments = launch.arguments
+        let stdin = Pipe()
+        helper.standardInput = stdin
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+        try helper.run()
+        defer {
+            try? stdin.fileHandleForWriting.close()
+            helper.waitUntilExit()
+        }
+
+        let pid = helper.processIdentifier
+        let deadline = Date().addingTimeInterval(5)
+        repeat {
+            model.refreshDetectedMCPProcesses()
+            if model.detectedMCPProcesses.contains(where: { $0.pid == pid }) { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        } while Date() < deadline
+        guard model.detectedMCPProcesses.contains(where: { $0.pid == pid }),
+              model.connectedClients(forPaperID: paper.id).isEmpty else {
+            throw PaperDeskError.invalid("未握手的连接进程显示为了已连接客户端。")
+        }
+
+        let identity = "selfcheck-unnamed"
+        _ = service.handle(BridgeRequest(method: "__mcp_client_heartbeat", arguments: .object([
+            "_bound_paper_id": .string(paper.id), "_bound_document_hash": .string(paper.fileHash),
+            "_conversation_id": .string(identity), "_client_pid": .number(Double(pid))
+        ])))
+        let connections = model.connectedClients(forPaperID: paper.id)
+        guard connections.count == 1, connections.first?.id == identity,
+              connections.first?.displayName == "Codex", connections.first?.clientID == "codex" else {
+            throw PaperDeskError.invalid("已确认的无名连接没有从对应进程识别出 Codex。")
+        }
+        _ = service.handle(BridgeRequest(method: "__mcp_client_disconnected", arguments: .object([
+            "_conversation_id": .string(identity)
+        ])))
+        guard model.connectedClients(forPaperID: paper.id).isEmpty else {
+            throw PaperDeskError.invalid("断开后，仍在运行的辅助进程被显示为已连接。")
+        }
+        print("PASS: idle helpers stay hidden and the matching process names an anonymous live connection")
+    }
+
     static func checkReadingState() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("paperdesk-state-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
+        let preferenceDomain = "paperdesk.selfcheck." + directory.lastPathComponent
+        guard let preferences = UserDefaults(suiteName: preferenceDomain) else {
+            throw PaperDeskError.invalid("无法打开自检设置。")
+        }
+        defer { preferences.removePersistentDomain(forName: preferenceDomain) }
         let (model, paper) = try projectFixture(at: directory)
         let store = model.store
         let saved = try store.readingState(paperID: paper.id)
@@ -306,6 +701,7 @@ enum ReaderSelfCheck {
         guard !model.connectedClients(forPaperID: paper.id).contains(where: { $0.clientName == "opencode" }) else {
             throw PaperDeskError.invalid("MCP 断开后仍显示连接。")
         }
+        try checkUnnamedClient(model: model, paper: paper, service: service)
         func boundTool(_ name: String, _ args: [String: JSONValue] = [:], expectError: Bool = false) throws -> JSONValue {
             var params = args
             params["_bound_paper_id"] = .string(paper.id)
@@ -324,9 +720,30 @@ enum ReaderSelfCheck {
               capture["content"].arrayValue?.first?["text"].stringValue?.contains("time-independent") == true else {
             throw PaperDeskError.invalid("项目没有同时收到两张原公式图与条件文字。")
         }
+        for client in ["Codex", "OpenCode", "Future harness"] {
+            let status = try boundTool(MCPProtocol.connectionStatusTool, ["_client_name": .string(client)])["structuredContent"]
+            guard status == capture["structuredContent"]["connection_policy"],
+                  status["connected"].boolValue == true,
+                  status["citation_mode"].stringValue == "selected_passages" else {
+                throw PaperDeskError.invalid("不同客户端没有收到一致的连接与标注权限。")
+            }
+        }
+        model.allowsAICitationMarks = false
+        guard try boundTool(MCPProtocol.connectionStatusTool)["structuredContent"]["citation_mode"].stringValue == "disabled",
+              try boundTool("cite_passage", [
+                  "snapshot_id": .string(snapshotID), "selection_context_id": .string(saved.selections[0].id)
+              ], expectError: true)["structuredContent"]["code"].stringValue == "citation_marks_disabled",
+              try store.snapshotCitations(snapshotID: snapshotID).isEmpty,
+              try !AppModel(store: store, preferences: preferences).allowsAICitationMarks else {
+            throw PaperDeskError.invalid("关闭标注后权限未生效或未保存。")
+        }
+        model.allowsAICitationMarks = true
         let contactTime = model.codexLastContact[paper.id]
         let reopenedContactModel = try AppModel(store: LibraryStore(rootURL: store.rootURL))
         reopenedContactModel.openPaper(paper)
+        guard reopenedContactModel.scope == .document else {
+            throw PaperDeskError.invalid("重启后没有恢复全文读取。")
+        }
         guard let contactTime, let restoredContact = reopenedContactModel.codexLastContact[paper.id],
               abs(restoredContact.timeIntervalSince(contactTime)) < 1 else {
             throw PaperDeskError.invalid("项目访问记录没有在重新打开后恢复。")
@@ -514,10 +931,67 @@ enum ReaderSelfCheck {
               head + tail == longText, secondPart["answer_next_offset"] == .null else {
             throw PaperDeskError.invalid("长讨论分段读取时损失了内容。")
         }
+        try checkReadingFeedback(snapshotID: snapshot.id) { name, arguments, expectError in
+            try boundTool(name, arguments, expectError: expectError)["structuredContent"]
+        }
         print("PASS: cross-page A/B/C, stable labels, frozen sources, paper switch, restart, review navigation and idempotent discussion")
         print("PASS: project extractive save accepts verified source IDs, rejects unknown ones and records coverage")
         print("PASS: editable excerpt review, rephrased notes, and offline discussion with durable sharing")
         print("PASS: historical search, per-paper access, manual sharing and approved note retrieval")
+    }
+
+    private static func checkReadingFeedback(
+        snapshotID: String, tool: (String, [String: JSONValue], Bool) throws -> JSONValue
+    ) throws {
+        let archive: [String: JSONValue] = [
+            "_client_name": .string("Codex"), "_conversation_id": .string("feedback-check"),
+            "snapshot_id": .string(snapshotID), "question": .string("What does H do?"),
+            "answer": .string("It generates the evolution."), "source_context_ids": .array([]),
+            "idempotency_key": .string("feedback-check-first"), "answer_mode": .string("direct")
+        ]
+        func messageID(_ parameters: [String: JSONValue]) throws -> String {
+            guard let id = try tool("save_discussion", parameters, false)["message_id"].stringValue else {
+                throw PaperDeskError.missing("反馈测试的问答没有归档。")
+            }
+            return id
+        }
+        let first = try messageID(archive)
+        var followUp = archive
+        followUp["idempotency_key"] = .string("feedback-check-follow-up")
+        followUp["question"] = .string("还是没看懂。H 怎么决定下一步？")
+        followUp["answer"] = .string("Here is the missing step.")
+        followUp["answer_mode"] = .string("self_review")
+        followUp["feedback"] = .object(["kind": .string("unclear"), "evidence": .string("还是没看懂")])
+        _ = try tool("save_discussion", followUp, true)
+        followUp["previous_discussion_id"] = .string(first)
+        var forged = followUp
+        forged["feedback"] = .object(["kind": .string("unclear"), "evidence": .string("用户原话里没有的内容")])
+        _ = try tool("save_discussion", forged, true)
+        let second = try messageID(followUp)
+        guard try messageID(followUp) == second else { throw PaperDeskError.conflict("反馈重试生成了重复记录。") }
+
+        let secondDiscussion = try tool("get_discussion", ["discussion_id": .string(second)], false)
+        let messages = secondDiscussion["messages"].arrayValue ?? []
+        guard messages.first?["feedback"]["answer_id"].stringValue == first,
+              messages.first?["feedback"]["evidence"].stringValue == "还是没看懂",
+              messages.last?["answer_mode"].stringValue == "self_review" else {
+            throw PaperDeskError.conflict("阅读反馈没有保留用户原话或关联正确的上一条回答。")
+        }
+
+        followUp["idempotency_key"] = .string("feedback-check-neutral")
+        followUp["question"] = .string("这一步在另一种情况下怎么用？")
+        followUp["feedback"] = .object(["kind": .string("follow_up"), "evidence": .string("这一步在另一种情况下怎么用？")])
+        _ = try tool("save_discussion", followUp, true)
+        followUp["previous_discussion_id"] = .string(second)
+        _ = try messageID(followUp)
+        let modes = try tool("reading_feedback_summary", [:], false)["by_answer_mode"].arrayValue ?? []
+        let direct = modes.first { $0["answer_mode"].stringValue == "direct" }
+        let selfReview = modes.first { $0["answer_mode"].stringValue == "self_review" }
+        guard direct?["unclear"].intValue == 1, direct?["follow_up"].intValue == 0,
+              selfReview?["follow_up"].intValue == 1, selfReview?["unclear"].intValue == 0 else {
+            throw PaperDeskError.conflict("反馈统计没有按被回应的答案模式正确计数。")
+        }
+        print("PASS: grounded feedback links to the previous answer, retries safely, and keeps ordinary follow-ups separate")
     }
 
     static func checkRegionPreview() throws {
@@ -612,13 +1086,93 @@ enum ReaderSelfCheck {
         print("PASS: saved region shade and letter remain visible until the selection is cleared")
     }
 
+    static func checkQuestionBubble() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("paperdesk-bubble-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (model, _) = try projectFixture(at: directory)
+        model.cancelProjectNamePrompt()
+        let application = NSApplication.shared
+        let bounds = NSRect(x: 0, y: 0, width: 1100, height: 690)
+        let window = NSWindow(contentRect: bounds, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let hosting = NSHostingView(rootView: ReaderView(model: model))
+        window.contentView = hosting
+        window.makeKeyAndOrderFront(nil)
+
+        func settle() {
+            hosting.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            hosting.layoutSubtreeIfNeeded()
+        }
+        func findEditor(in view: NSView) -> NSTextView? {
+            guard !view.isHidden else { return nil }
+            if let editor = view as? NSTextView, editor.isEditable, !editor.isFieldEditor { return editor }
+            return view.subviews.lazy.compactMap { findEditor(in: $0) }.first
+        }
+        func findReader(in view: NSView) -> PDFReaderContainer? {
+            if let reader = view as? PDFReaderContainer { return reader }
+            return view.subviews.lazy.compactMap { findReader(in: $0) }.first
+        }
+        func pointer(at start: NSPoint, to end: NSPoint? = nil) throws {
+            let events: [(NSEvent.EventType, NSPoint)] = end.map { destination in
+                let middle = NSPoint(x: (start.x + destination.x) / 2, y: (start.y + destination.y) / 2)
+                return [(.leftMouseDown, start), (.leftMouseDragged, middle), (.leftMouseDragged, destination), (.leftMouseUp, destination)]
+            } ?? [(.leftMouseDown, start), (.leftMouseUp, start)]
+            let startTime = ProcessInfo.processInfo.systemUptime
+            for (index, step) in events.enumerated() {
+                guard let event = NSEvent.mouseEvent(with: step.0, location: step.1, modifierFlags: [],
+                    timestamp: startTime + Double(index) * 0.02, windowNumber: window.windowNumber,
+                    context: nil, eventNumber: index, clickCount: 1, pressure: step.0 == .leftMouseUp ? 0 : 1) else {
+                    throw PaperDeskError.invalid("无法创建提问气泡检查事件。")
+                }
+                application.postEvent(event, atStart: false)
+            }
+            let deadline = Date().addingTimeInterval(0.1)
+            while let event = application.nextEvent(matching: .any, until: deadline, inMode: .default, dequeue: true) {
+                application.sendEvent(event)
+            }
+            settle()
+        }
+
+        settle()
+        guard let reader = findReader(in: hosting) else {
+            throw PaperDeskError.invalid("无法定位准备检查提问气泡的 PDF 阅读区。")
+        }
+        guard findEditor(in: hosting) == nil else { throw PaperDeskError.invalid("检查前已出现多行输入框。") }
+        let readerFrame = reader.convert(reader.bounds, to: nil)
+        let original = NSPoint(x: readerFrame.maxX - 33, y: readerFrame.minY + 33)
+        let moved = NSPoint(x: original.x - 125, y: original.y + 95)
+        try pointer(at: original)
+        guard let editor = findEditor(in: hosting), let editorScroll = editor.enclosingScrollView,
+              let composerScroll = editorScroll.enclosingScrollView else {
+            throw PaperDeskError.invalid("点击提问气泡后没有显示可滚动的输入框。")
+        }
+        let inputHeight = editorScroll.contentSize.height
+        let composerHeight = composerScroll.bounds.height
+        guard inputHeight >= 185, composerHeight < readerFrame.height - 90 else {
+            throw PaperDeskError.invalid("提问框高度不合适（输入区 \(inputHeight)，面板 \(composerHeight)）。")
+        }
+        try pointer(at: original)
+        guard findEditor(in: hosting) == nil else { throw PaperDeskError.invalid("再次点击提问气泡后没有关闭输入框。") }
+        try pointer(at: original, to: moved)
+        guard findEditor(in: hosting) == nil else { throw PaperDeskError.invalid("拖动提问气泡时误打开了输入框。") }
+        try pointer(at: moved)
+        guard findEditor(in: hosting) != nil else { throw PaperDeskError.invalid("拖动后点击提问气泡没有打开输入框。") }
+        print("PASS: the composer hugs its content (\(composerHeight) points) with a \(inputHeight)-point editor")
+        print("PASS: the question bubble opens and closes the editor by click, and can be dragged without opening it")
+    }
+
     static func checkReaderSelectionMarks() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("paperdesk-reader-marks-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let source = directory.appendingPathComponent("source.pdf")
         try SamplePDF.create(at: source)
-        let model = try AppModel(store: LibraryStore(rootURL: directory.appendingPathComponent("library")))
+        guard let preferences = UserDefaults(suiteName: "paperdesk.selfcheck." + directory.lastPathComponent) else {
+            throw PaperDeskError.invalid("无法打开自检设置。")
+        }
+        let model = try AppModel(store: LibraryStore(rootURL: directory.appendingPathComponent("library")), preferences: preferences)
         model.openPDF(url: source)
         guard let document = model.document, let page = document.page(at: 0), let secondPage = document.page(at: 1) else {
             throw PaperDeskError.invalid("无法打开选区标记自检文献。")
@@ -734,6 +1288,7 @@ enum ReaderSelfCheck {
         let file = model.store.readingPDFURL(for: paper)
         let original = try Data(contentsOf: file)
         let navigationBefore = model.navigationSerial
+        model.scope = .document
         let firstCitation = try tool("cite_passage", ["snapshot_id": .string(snapshotID),
                                                       "document_hash": .string(paper.fileHash),
                                                       "page_index": .number(0),
@@ -764,12 +1319,20 @@ enum ReaderSelfCheck {
             throw PaperDeskError.invalid("第二条引用没有递增编号。")
         }
 
-        // Scope enforcement still applies to citation locations.
+        // Previously shared passages can be cited without granting page access.
         model.scope = .selection
-        guard try tool("cite_passage", ["snapshot_id": .string(snapshotID),
+        let selectedSnapshot = try tool("capture_reading_state")["structuredContent"]
+        guard let selectedSnapshotID = selectedSnapshot["snapshot_id"].stringValue,
+              selectedSnapshot["connection_policy"]["citation_mode"].stringValue == "selected_passages",
+              try tool("cite_passage", ["snapshot_id": .string(selectedSnapshotID),
+                                       "selection_context_id": .string(text.id)])["structuredContent"]["number"].intValue == 1,
+              try tool("cite_passage", ["snapshot_id": .string(selectedSnapshotID),
+                                       "page_index": .number(Double(secondPageIndex)),
+                                       "quote": .string(secondQuote)])["structuredContent"]["number"].intValue == 1,
+              try tool("cite_passage", ["snapshot_id": .string(selectedSnapshotID),
                                         "document_hash": .string(paper.fileHash),
-                                        "page_index": .number(Double(secondPageIndex)),
-                                        "quote": .string(secondQuote)])["isError"].boolValue == true else {
+                                        "page_index": .number(0),
+                                        "quote": .string(quote)])["structuredContent"]["code"].stringValue == "selection_required" else {
             throw PaperDeskError.invalid("引用没有遵守仅选区的共享范围。")
         }
         model.scope = .document
@@ -1150,8 +1713,7 @@ enum ReaderSelfCheck {
         guard status["context_id"].stringValue == context.id else { throw PaperDeskError.invalid("当前选区身份不匹配。") }
         let capture = try tool("get_context", ["context_id": .string(context.id)])
         guard capture["text"].stringValue?.contains("Hermitian") == true else { throw PaperDeskError.invalid("选区内容不匹配。") }
-        // A newly opened paper defaults to selection scope. Explicitly opting
-        // into the document scope still allows page reads when requested.
+        // Exercise both temporary restrictions and full-document access.
         model.scope = .document
         _ = try tool("read_pages", ["paper_id": .string(paper.id), "page_indices": .array([.number(0)])])
         model.scope = .selection

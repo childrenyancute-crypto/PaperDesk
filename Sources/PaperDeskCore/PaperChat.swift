@@ -5,6 +5,33 @@ public enum PaperChatRole: String, Codable, Sendable {
     case assistant
 }
 
+/// The kind of reading feedback attached to a follow-up question.
+public enum ReadingFeedbackKind: String, Codable, Equatable, Sendable {
+    case unclear
+    case repeatedQuestion = "repeated_question"
+    case followUp = "follow_up"
+}
+
+/// How the assistant answered the current question.
+public enum ReadingAnswerMode: String, Codable, Equatable, Sendable {
+    case direct
+    case selfReview = "self_review"
+    case independentReview = "independent_review"
+}
+
+/// A bounded, answer-linked reading-quality signal recorded with a question.
+public struct ReadingFeedback: Codable, Equatable, Sendable {
+    public var kind: ReadingFeedbackKind
+    public var evidence: String
+    public var answerID: String
+
+    public init(kind: ReadingFeedbackKind, evidence: String, answerID: String) {
+        self.kind = kind
+        self.evidence = evidence
+        self.answerID = answerID
+    }
+}
+
 /// One numbered source attached to an archived answer. Citations are
 /// per-answer footnotes: they never enter the reader's selection list and they
 /// are highlighted in the PDF only while their answer is being read.
@@ -20,6 +47,38 @@ public struct MessageCitation: Identifiable, Codable, Equatable, Sendable {
         self.contextID = contextID
         self.label = label
         self.pageLabel = pageLabel
+    }
+}
+
+/// A bibliography entry as it appeared when an answer was archived. Keeping
+/// this small snapshot prevents a later re-index from changing old links.
+public struct MessageReference: Identifiable, Codable, Equatable, Sendable {
+    public var referenceID: String
+    public var label: String
+    public var authors: String?
+    public var firstAuthor: String?
+    public var title: String?
+    public var year: Int?
+    public var status: PaperReferenceStatus
+
+    public var id: String { referenceID }
+
+    public init(referenceID: String, label: String, authors: String? = nil,
+                firstAuthor: String? = nil, title: String? = nil, year: Int? = nil,
+                status: PaperReferenceStatus = .unverified) {
+        self.referenceID = referenceID
+        self.label = label
+        self.authors = authors
+        self.firstAuthor = firstAuthor
+        self.title = title
+        self.year = year
+        self.status = status
+    }
+
+    public init(_ reference: PaperReference) {
+        self.init(referenceID: reference.id, label: reference.displayLabel, authors: reference.authors,
+                  firstAuthor: reference.firstAuthor, title: reference.title, year: reference.year,
+                  status: reference.status)
     }
 }
 
@@ -52,6 +111,11 @@ public struct PaperChatMessage: Identifiable, Codable, Equatable, Sendable {
     /// Numbered sources cited by this answer. `nil` for legacy records and for
     /// questions.
     public var citations: [MessageCitation]?
+    /// Bibliography entries linked by this answer. `nil` means this is a
+    /// legacy record whose links may be resolved from the current index.
+    public var referencedWorks: [MessageReference]?
+    /// Advisory notes from the answer's citation review.
+    public var citationWarnings: [String]?
     /// Identifies the client that created this message, when available.
     public var origin: RecordOrigin?
     /// Whether this message was explicitly recorded by the user rather than
@@ -68,9 +132,14 @@ public struct PaperChatMessage: Identifiable, Codable, Equatable, Sendable {
     /// The last available title for this conversation, including titles
     /// synchronized from external clients.
     public var conversationTitle: String?
+    /// A reading-quality signal attached to a user question. The signal
+    /// points at the prior assistant answer that prompted the follow-up.
+    public var readingFeedback: ReadingFeedback?
+    /// How the assistant answered this message's question.
+    public var answerMode: ReadingAnswerMode?
     public var isExtractiveSummary: Bool { summaryNoteID != nil }
 
-    public init(id: String = UUID().uuidString, role: PaperChatRole, text: String, pageLabel: String? = nil, contextID: String? = nil, sourcePageIndex: Int? = nil, createdAt: Date = Date(), summarySources: [ExtractiveSource]? = nil, summaryNoteID: String? = nil, readingSnapshotID: String? = nil, sourceContextIDs: [String]? = nil, origin: RecordOrigin? = nil, manuallyRecorded: Bool? = nil, sharedWithAI: Bool? = nil, conversationID: String? = nil, conversationTitle: String? = nil, citations: [MessageCitation]? = nil) {
+    public init(id: String = UUID().uuidString, role: PaperChatRole, text: String, pageLabel: String? = nil, contextID: String? = nil, sourcePageIndex: Int? = nil, createdAt: Date = Date(), summarySources: [ExtractiveSource]? = nil, summaryNoteID: String? = nil, readingSnapshotID: String? = nil, sourceContextIDs: [String]? = nil, origin: RecordOrigin? = nil, manuallyRecorded: Bool? = nil, sharedWithAI: Bool? = nil, conversationID: String? = nil, conversationTitle: String? = nil, citations: [MessageCitation]? = nil, referencedWorks: [MessageReference]? = nil, citationWarnings: [String]? = nil, readingFeedback: ReadingFeedback? = nil, answerMode: ReadingAnswerMode? = nil) {
         self.id = id
         self.role = role
         self.text = text
@@ -88,6 +157,10 @@ public struct PaperChatMessage: Identifiable, Codable, Equatable, Sendable {
         self.conversationID = conversationID
         self.conversationTitle = conversationTitle
         self.citations = citations
+        self.referencedWorks = referencedWorks
+        self.citationWarnings = citationWarnings
+        self.readingFeedback = readingFeedback
+        self.answerMode = answerMode
     }
 }
 

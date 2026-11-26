@@ -266,6 +266,65 @@ public enum Verification {
         }
 
 
+        try check("reference parser extracts bibliography entries") {
+            let drafts = PaperReferenceParser.entries(from: [
+                PaperReferencePageText(pageIndex: 2, pageLabel: "3", text: """
+                References
+
+                [1] Smith, J., & Doe, A. (2020). Quantum reading with structured references. Journal of Examples, 12(3), 45-67. https://doi.org/10.1234/example.2020.001
+                [2] Vaswani, A. et al. (2017). Attention is all you need. In Advances in Neural Information Processing Systems (pp. 5998-6008).
+                [3] Chen, L. A study of local-first readers. arXiv:2101.12345v2.
+                """)
+            ])
+            try require(drafts.count == 3, "parser should find three numbered entries")
+            try require(drafts[0].doi == "10.1234/example.2020.001", "parser should retain the DOI")
+            try require(drafts[0].firstAuthor == "Smith", "parser should extract the first author")
+            try require(drafts[1].year == 2017, "parser should extract the year")
+            try require(drafts[2].arxivID == "2101.12345v2", "parser should retain the arXiv identifier")
+        }
+
+        try check("reference storage verifies and reindexes safely") {
+            let root = try temporaryRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let source = root.appendingPathComponent("references.pdf")
+            try SamplePDF.create(at: source)
+            let store = try LibraryStore(rootURL: root.appendingPathComponent("library", isDirectory: true))
+            let paper = try store.importPDF(from: source, title: "References", pageCount: 3)
+            let drafts = PaperReferenceParser.entries(from: [
+                PaperReferencePageText(pageIndex: 2, pageLabel: "3", text: """
+                Bibliography
+                [1] Smith, J. (2020). A local first reader. Journal of Examples, 1, 1-2. doi:10.1234/one
+                [2] Doe, A. (2021). Another paper. Journal of Tests, 2, 3-4.
+                """)
+            ])
+            try require(drafts.count == 2, "storage fixture should contain two entries")
+            try store.replacePDFBibliography(paperID: paper.id, entries: drafts,
+                                              headingPageIndex: 2, parserVersion: PaperReferenceParser.version)
+            var references = try store.references(paperID: paper.id)
+            try require(references.count == 2 && references.allSatisfy { $0.status == .unverified },
+                        "a new bibliography should start unverified")
+            let first = references[0]
+            let verified = try store.verifyReference(id: first.id, authors: "Smith, John",
+                                                     title: "A Local First Reader", year: 2020,
+                                                     venue: "Journal of Examples", doi: "10.1234/one",
+                                                     arxivID: nil, url: nil, bibtex: nil,
+                                                     verifiedBy: "Codex", evidenceURL: "https://doi.org/10.1234/one")
+            try require(verified.status == .verified && verified.firstAuthor == "Smith",
+                        "verification should set status and recompute the first author")
+            let weaker = PaperReferenceDraft(label: "1", entryIndex: 0, authors: nil, firstAuthor: nil,
+                                              title: nil, year: nil, venue: nil, doi: "10.1234/one",
+                                              arxivID: nil, url: nil,
+                                              rawText: "[1] Smith, J. (2020). A local first reader.",
+                                              pageIndex: 2, pageLabel: "3",
+                                              fingerprint: "reindexed-fingerprint")
+            try store.replacePDFBibliography(paperID: paper.id, entries: [weaker],
+                                              headingPageIndex: 2, parserVersion: PaperReferenceParser.version)
+            references = try store.references(paperID: paper.id)
+            try require(references.count == 1 && references[0].status == .verified
+                        && references[0].title == "A Local First Reader",
+                        "re-indexing must preserve AI-verified metadata")
+        }
+
         try check("latex subset normalization and validation") {
             try require(LatexSubset.normalize(#"\dfrac{a}{b}"#) == #"\frac{a}{b}"#,
                         "dfrac should normalize to frac")

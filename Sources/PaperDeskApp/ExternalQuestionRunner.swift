@@ -1,6 +1,14 @@
 import Foundation
 import PaperDeskCore
 
+/// Coarse-grained milestones shown by PaperDesk while a harness is running.
+/// They intentionally describe stable workflow stages instead of exposing
+/// provider-specific token or reasoning events.
+enum QuestionClientEvent: Sendable {
+    case connected
+    case generatingAnswer
+}
+
 /// The result of one non-interactive request sent to an external coding
 /// client.  The session identifier is deliberately returned alongside the
 /// answer: it is the value that PaperDesk must persist in order to continue
@@ -127,7 +135,9 @@ enum ExternalQuestionRunner {
 
     static func runProcess(executable: URL, arguments: [String], environment: [String: String],
                            standardInput: String?, project: URL,
-                           timeout: TimeInterval = maximumRunDuration) async throws -> ProcessOutput {
+                           timeout: TimeInterval = maximumRunDuration,
+                           progressFromLine: (@Sendable (Data) -> QuestionClientEvent?)? = nil,
+                           onProgress: @escaping @Sendable (QuestionClientEvent) async -> Void = { _ in }) async throws -> ProcessOutput {
         try Task.checkCancellation()
         let process = Process()
         let stdout = Pipe()
@@ -161,11 +171,22 @@ enum ExternalQuestionRunner {
         }
 
         let stdoutTask = Task.detached {
-            do { return try Self.readAll(from: stdout.fileHandleForReading) }
+            do {
+                guard let progressFromLine else { return try await readOutput(from: stdout.fileHandleForReading) }
+                let (events, progress) = AsyncStream.makeStream(of: QuestionClientEvent.self, bufferingPolicy: .bufferingOldest(16))
+                defer { progress.finish() }
+                async let delivery: Void = forwardProgress(events, to: onProgress)
+                let output = try await readOutput(from: stdout.fileHandleForReading) { line in
+                    if let event = progressFromLine(line) { progress.yield(event) }
+                }
+                progress.finish()
+                await delivery
+                return output
+            }
             catch { holder.terminate(); throw error }
         }
         let stderrTask = Task.detached {
-            do { return try Self.readAll(from: stderr.fileHandleForReading) }
+            do { return try await readOutput(from: stderr.fileHandleForReading) }
             catch { holder.terminate(); throw error }
         }
         let deadline = Date().addingTimeInterval(timeout)
@@ -191,7 +212,9 @@ enum ExternalQuestionRunner {
             throw error
         }
 
-        process.waitUntilExit()
+        // The loop has already observed termination. Foundation's blocking
+        // wait pumps a run loop and can hang when an async task resumes on
+        // a different thread from the one that launched the process.
         holder.clear()
         let output: Data
         let errorOutput: Data
@@ -213,15 +236,46 @@ enum ExternalQuestionRunner {
         return ProcessOutput(stdout: output, stderr: errorOutput)
     }
 
-    static func readAll(from handle: FileHandle) throws -> Data {
+    private static func forwardProgress(_ events: AsyncStream<QuestionClientEvent>,
+                                        to receive: @Sendable (QuestionClientEvent) async -> Void) async {
+        for await event in events { await receive(event) }
+    }
+
+    private static func readOutput(from handle: FileHandle,
+                                   onLine: (@Sendable (Data) -> Void)? = nil) async throws -> Data {
+        // Pipe reads block. Keep them off the Swift task executor so the
+        // bridge and progress updates can run while clients wait for output.
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(with: Result { try readAll(from: handle, onLine: onLine) })
+            }
+        }
+    }
+
+    static func readAll(from handle: FileHandle, onLine: (@Sendable (Data) -> Void)? = nil) throws -> Data {
         var data = Data()
+        var pending = Data()
         while true {
-            let chunk = try handle.read(upToCount: 64 * 1024) ?? Data()
-            if chunk.isEmpty { return data }
+            // Waiting for even a small live event to fill the read buffer
+            // would delay the progress display until the process exits.
+            let chunk = onLine == nil ? try handle.read(upToCount: 64 * 1024) ?? Data() : handle.availableData
+            if chunk.isEmpty {
+                if !pending.isEmpty { onLine?(pending) }
+                return data
+            }
             guard data.count <= maximumOutputBytes - chunk.count else {
                 throw ExternalQuestionRunnerError.outputTooLarge
             }
             data.append(chunk)
+            guard let onLine else { continue }
+            pending.append(chunk)
+            var start = pending.startIndex
+            while let newline = pending[start...].firstIndex(of: 0x0A) {
+                let line = Data(pending[start..<newline])
+                start = pending.index(after: newline)
+                if !line.isEmpty { onLine(line) }
+            }
+            pending.removeSubrange(..<start)
         }
     }
 

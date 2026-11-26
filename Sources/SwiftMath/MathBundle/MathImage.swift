@@ -55,7 +55,7 @@ extension MathImage {
             self.descent = descent
         }
     }
-    public mutating func asImage() -> (NSError?, MTImage?, LayoutInfo?) {
+    public mutating func asImage(scale: CGFloat = 0) -> (NSError?, MTImage?, LayoutInfo?) {
         func layoutImage(size: CGSize, displayList: MTMathListDisplay) {
             var textX = CGFloat(0)
             switch self.textAlignment {
@@ -88,7 +88,9 @@ extension MathImage {
         layoutImage(size: size, displayList: displayList)
         
         #if os(iOS) || os(visionOS)
-            let renderer = UIGraphicsImageRenderer(size: size)
+            let format = UIGraphicsImageRendererFormat.default()
+            if scale > 0 { format.scale = scale }
+            let renderer = UIGraphicsImageRenderer(size: size, format: format)
             let image = renderer.image { rendererContext in
                 rendererContext.cgContext.saveGState()
                 rendererContext.cgContext.concatenate(.flippedVertically(size.height))
@@ -98,6 +100,32 @@ extension MathImage {
             return (nil, image, LayoutInfo(ascent: displayList.ascent, descent: displayList.descent))
         #endif
         #if os(macOS)
+            if scale > 0 {
+                let pixelsWide = max(1, Int(ceil(size.width * scale)))
+                let pixelsHigh = max(1, Int(ceil(size.height * scale)))
+                guard let representation = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                                           pixelsWide: pixelsWide,
+                                                           pixelsHigh: pixelsHigh,
+                                                           bitsPerSample: 8,
+                                                           samplesPerPixel: 4,
+                                                           hasAlpha: true,
+                                                           isPlanar: false,
+                                                           colorSpaceName: .deviceRGB,
+                                                           bytesPerRow: 0,
+                                                           bitsPerPixel: 0) else {
+                    return (nil, nil, nil)
+                }
+                representation.size = size
+                guard let graphics = NSGraphicsContext(bitmapImageRep: representation) else {
+                    return (nil, nil, nil)
+                }
+                graphics.cgContext.saveGState()
+                displayList.draw(graphics.cgContext)
+                graphics.cgContext.restoreGState()
+                let image = NSImage(size: size)
+                image.addRepresentation(representation)
+                return (nil, image, LayoutInfo(ascent: displayList.ascent, descent: displayList.descent))
+            }
             let image = NSImage(size: size, flipped: false) { bounds in
                 guard let context = NSGraphicsContext.current?.cgContext else { return false }
                 context.saveGState()

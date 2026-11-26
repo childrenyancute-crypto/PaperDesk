@@ -35,6 +35,24 @@ final class ReaderTools {
         self.clientConversationID = clientConversationID
     }
 
+    func handleWithProgress(_ request: BridgeRequest) async -> BridgeResponse {
+        guard let requestID = request.arguments["_question_request"].stringValue,
+              let question = model.questions.request(id: requestID),
+              question.paperID == request.arguments["_bound_paper_id"].stringValue,
+              question.documentHash == request.arguments["_bound_document_hash"].stringValue else {
+            return handle(request)
+        }
+        let activity = model.questions.beginReaderActivity(request.method, requestID: requestID)
+        if activity != nil { await Task.yield() }
+        let response = handle(request)
+        if let activity {
+            model.questions.endReaderActivity(activity, requestID: requestID, result: response.result)
+        } else if request.method == "__mcp_client_connected", response.result?["isError"].boolValue != true {
+            model.questions.receiveClientEvent(.connected, requestID: requestID)
+        }
+        return response
+    }
+
     func handle(_ request: BridgeRequest) -> BridgeResponse {
         let previousBinding = (boundPaperID, boundDocumentHash, clientOrigin, clientConversationID, clientProcessID)
         let previousQuestion = pendingQuestion
@@ -84,7 +102,8 @@ final class ReaderTools {
                 pendingQuestion = pending
             }
             let result = try execute(request.method, arguments: request.arguments)
-            if (!request.method.hasPrefix("__mcp_") || request.method == "__mcp_resources_read"
+            if request.method != MCPProtocol.connectionStatusTool,
+               (!request.method.hasPrefix("__mcp_") || request.method == "__mcp_resources_read"
                 || request.method == "__mcp_client_connected"),
                let paperID = boundPaperID, let hash = boundDocumentHash,
                result["isError"].boolValue != true,
@@ -93,7 +112,7 @@ final class ReaderTools {
             }
             return BridgeResponse(id: request.id, result: result)
         } catch {
-            model.errorMessage = error.localizedDescription
+            if request.method != MCPProtocol.connectionStatusTool { model.errorMessage = error.localizedDescription }
             let message = error is PaperDeskError ? error.localizedDescription : "操作未完成，请在阅读窗口查看详情。"
             return BridgeResponse(id: request.id, result: .textResult(message, isError: true))
         }
@@ -305,7 +324,47 @@ final class ReaderTools {
         if message.isExtractiveSummary {
             value["is_extractive_summary"] = .bool(true)
         }
+        if let feedback = message.readingFeedback {
+            value["feedback"] = .object([
+                "kind": .string(feedback.kind.rawValue),
+                "evidence": .string(feedback.evidence),
+                "answer_id": .string(feedback.answerID)
+            ])
+        }
+        if let mode = message.answerMode {
+            value["answer_mode"] = .string(mode.rawValue)
+        }
         return .object(value)
+    }
+
+    private func readingFeedbackSummary(for paper: Paper) throws -> JSONValue {
+        let messages = try model.store.chatSession(paperID: paper.id).messages.filter {
+            $0.manuallyRecorded != true && !$0.isExtractiveSummary && messageIsReadable($0)
+        }
+        let answers = messages.filter { $0.role == .assistant }
+        let answerModes = Dictionary(answers.map { ($0.id, $0.answerMode?.rawValue ?? "unknown") },
+                                     uniquingKeysWith: { first, _ in first })
+        var modeCounts: [String: [ReadingFeedbackKind: Int]] = [:]
+        for message in messages where message.role == .user {
+            guard let feedback = message.readingFeedback, let mode = answerModes[feedback.answerID] else { continue }
+            modeCounts[mode, default: [:]][feedback.kind, default: 0] += 1
+        }
+        let answersByMode = Dictionary(grouping: answerModes.values, by: { $0 }).mapValues(\.count)
+        let knownModes = [ReadingAnswerMode.direct.rawValue, ReadingAnswerMode.selfReview.rawValue,
+                          ReadingAnswerMode.independentReview.rawValue, "unknown"]
+        return .object([
+            "paper_id": .string(paper.id),
+            "by_answer_mode": .array(knownModes.map { mode in
+                let counts = modeCounts[mode] ?? [:]
+                return .object([
+                    "answer_mode": .string(mode), "archived_answers": .number(Double(answersByMode[mode] ?? 0)),
+                    "unclear": .number(Double(counts[.unclear] ?? 0)),
+                    "repeated_question": .number(Double(counts[.repeatedQuestion] ?? 0)),
+                    "follow_up": .number(Double(counts[.followUp] ?? 0))
+                ])
+            }),
+            "interpretation": .string("Follow-ups are neutral. No recorded signal does not indicate satisfaction.")
+        ])
     }
 
     private func discussionObject(_ record: DiscussionRecord, includeMessages: Bool = false) -> JSONValue {
@@ -571,6 +630,7 @@ final class ReaderTools {
             "deferred_image_context_ids": .array(imageSelections.map { .string($0.id) }),
             "unavailable_image_context_ids": .array([])
         ]
+        metadata["connection_policy"] = .object(connectionPolicy(for: paper))
 
         // Both transports wrap the tool result. Leave room for their envelope
         // and measure the encoded blocks, including base64 and JSON overhead.
@@ -665,6 +725,9 @@ final class ReaderTools {
             let state = try model.store.readingState(paperID: paper.id)
             let goal = (try? model.store.chatSession(paperID: paper.id).readingInstructions) ?? ""
             return try result(try stateObject(state, paper: paper, readingGoal: goal, live: model.selectedPaper?.id == paper.id))
+        case MCPProtocol.connectionStatusTool:
+            let paper = boundPaperID == nil ? model.selectedPaper : try resolvePaper()
+            return try result(.object(connectionPolicy(for: paper)))
         case "capture_reading_state":
             let paper = try resolvePaper()
             if let pendingQuestion { return try snapshotResult(pendingQuestion.snapshot, paper: paper) }
@@ -688,6 +751,11 @@ final class ReaderTools {
             if let pendingQuestion, arguments["snapshot_id"].stringValue != pendingQuestion.snapshot.id {
                 throw PaperDeskError.conflict("请使用发送时固定的阅读快照来引用原文。")
             }
+            if !model.allowsAICitationMarks {
+                return citationPolicyError("citation_marks_disabled",
+                    L("PaperDesk 的「允许 AI 标记 PDF 原文」已关闭。请保留文字出处。",
+                      "PDF citation marks are disabled in PaperDesk. Use a plain-text reference."))
+            }
             return try citePassage(arguments)
         case "read_pages":
             let paper = try resolvePaper(id: arguments["paper_id"].stringValue)
@@ -697,58 +765,201 @@ final class ReaderTools {
                 throw PaperDeskError.invalid("请指定一至十个整数页码索引")
             }
             return try result(try readPages(paper: paper, pageIndices: values.compactMap(\.intValue)))
+        case "list_references":
+            let paper = try resolveCurrentPaper(id: arguments["paper_id"].stringValue)
+            var values = try model.store.references(paperID: paper.id)
+            if let status = arguments["status"].stringValue,
+               status == "unverified" || status == "verified" {
+                values = values.filter { $0.status.rawValue == status }
+            }
+            let page = paged(values, arguments: arguments, maximumPageSize: 50)
+            let index = try model.store.referenceIndex(paperID: paper.id)
+            return try result(.object([
+                "paper_id": .string(paper.id),
+                "document_hash": .string(paper.fileHash),
+                "index_state": index.map { .string($0.state.rawValue) } ?? .null,
+                "index_parser_version": index.map { .number(Double($0.parserVersion)) } ?? .null,
+                "total": .number(Double(values.count)),
+                "page": .number(Double(page.page)),
+                "page_size": .number(Double(page.pageSize)),
+                "has_more": .bool(page.hasMore),
+                "next_page": page.hasMore ? .number(Double(page.page + 1)) : .null,
+                "references": .array(page.pageValues.map { referenceObject($0, rawLimit: 600) })
+            ]))
+        case "get_reference":
+            let paper = try resolveCurrentPaper()
+            let id = try required("reference_id", arguments, maximum: 512)
+            guard let reference = try model.store.reference(id: id), reference.paperID == paper.id else {
+                throw PaperDeskError.missing(L("找不到这条参考文献，或它不属于当前文献", "Reference not found, or it does not belong to the current paper"))
+            }
+            return try result(.object(["reference": referenceObject(reference, rawLimit: 20_000)]))
+        case "verify_reference":
+            let paper = try resolveCurrentPaper()
+            let id = try required("reference_id", arguments, maximum: 512)
+            guard let reference = try model.store.reference(id: id), reference.paperID == paper.id else {
+                throw PaperDeskError.missing(L("找不到这条参考文献，或它不属于当前文献", "Reference not found, or it does not belong to the current paper"))
+            }
+            let authors = try required("authors", arguments, maximum: 500)
+            let title = try required("title", arguments, maximum: 500)
+            guard let year = arguments["year"].intValue else { throw PaperDeskError.invalid(L("缺少有效的 year", "A valid year is required")) }
+            let maximumYear = Calendar.current.component(.year, from: Date()) + 1
+            guard year >= 1000, year <= maximumYear else { throw PaperDeskError.invalid(L("year 超出有效范围", "The year is out of range")) }
+            let venue = optionalReferenceText(arguments["venue"])
+            let doi = optionalReferenceText(arguments["doi"])
+            let arxiv = optionalReferenceText(arguments["arxiv_id"])
+            let url = optionalReferenceText(arguments["url"])
+            let evidence = optionalReferenceText(arguments["evidence_url"])
+            for link in [url, evidence] {
+                guard let link, let parsed = URL(string: link),
+                      let scheme = parsed.scheme?.lowercased(), scheme == "https" || scheme == "http",
+                      parsed.host?.isEmpty == false, parsed.user == nil, parsed.password == nil else {
+                    if link != nil { throw PaperDeskError.invalid(L("链接必须是有效的 http(s) 地址", "The link must be a valid http(s) address")) }
+                    continue
+                }
+            }
+            let bibtex = optionalReferenceText(arguments["bibtex"])
+            let verifiedBy = clientOrigin?.clientName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let updated = try model.store.verifyReference(
+                id: reference.id, authors: authors, title: title, year: year,
+                venue: venue, doi: doi, arxivID: arxiv, url: url, bibtex: bibtex,
+                verifiedBy: (verifiedBy?.isEmpty == false ? verifiedBy! : L("AI 客户端")),
+                evidenceURL: evidence)
+            if model.selectedPaper?.id == paper.id { model.refreshReferences() }
+            model.synchronizeProjectFiles(paperID: paper.id)
+            return try result(.object([
+                "verified": .bool(true),
+                "paper_id": .string(paper.id),
+                "reference": referenceObject(updated, rawLimit: 20_000)
+            ]))
         case "save_discussion":
             let snapshotID = try required("snapshot_id", arguments)
             if let pendingQuestion, pendingQuestion.snapshot.id != snapshotID {
                 throw PaperDeskError.conflict("请使用发送时固定的阅读快照来保存回答。")
             }
             let question = try pendingQuestion?.question ?? required("question", arguments, maximum: 20_000)
-            let answer = try required("answer", arguments, maximum: 100_000)
+            let submittedAnswer = try required("answer", arguments, maximum: 100_000)
+            var answer = submittedAnswer
             let key = try pendingQuestion?.archiveKey ?? required("idempotency_key", arguments, maximum: 256)
             let sourceIDs = try stringArray("source_context_ids", arguments, maximum: 32)
-            var citations = try citationArray(arguments["citations"], maximum: 8)
+            var citations = try citationArray(arguments["citations"], maximum: 32)
+            var citationWarnings = try citationWarningArray(arguments["citation_warnings"])
             guard let snapshot = try model.store.readingSnapshot(id: snapshotID) else { throw PaperDeskError.missing("找不到这份阅读状态快照") }
             let paper = try resolvePaper(id: snapshot.state.paperID)
             let allowed = Set(snapshot.state.selections.map(\.id))
             guard Set(sourceIDs).isSubset(of: allowed) else { throw PaperDeskError.conflict("讨论引用了不属于这次阅读状态的选区") }
-            let markerLabels = citationLabels(in: answer)
-            if citations.isEmpty {
-                guard markerLabels.isEmpty else {
-                    throw PaperDeskError.conflict("回答包含出处编号，但没有提交对应的 citations。请一并提交每个 ⟦n⟧ 的出处。")
+            var markerLabels = citationLabels(in: answer)
+            let numbered = Dictionary(uniqueKeysWithValues: try model.store.snapshotCitations(snapshotID: snapshotID)
+                .map { ($0.context.id, $0) })
+            var normalized: [MessageCitation] = []
+            var seenContextIDs = Set<String>()
+            var submittedLabelMappings: [String: Set<String>] = [:]
+            for citation in citations {
+                guard seenContextIDs.insert(citation.contextID).inserted else {
+                    citationWarnings.append("同一处原文重复提交，已忽略重复项。")
+                    continue
                 }
-            } else {
-                let numbered = Dictionary(uniqueKeysWithValues: try model.store.snapshotCitations(snapshotID: snapshotID).map { ($0.context.id, $0) })
-                var normalized: [MessageCitation] = []
-                var seenContextIDs = Set<String>()
-                for citation in citations {
-                    guard seenContextIDs.insert(citation.contextID).inserted else {
-                        throw PaperDeskError.invalid("citations 不能重复提交同一处原文。")
-                    }
-                    guard let row = numbered[citation.contextID] else {
-                        throw PaperDeskError.conflict("讨论引用了不属于这份阅读状态的出处")
-                    }
-                    let expectedLabel = String(row.number)
-                    guard citation.label == expectedLabel else {
-                        throw PaperDeskError.conflict("出处 \(citation.contextID) 的编号应为 ⟦\(expectedLabel)⟧，实际收到 ⟦\(citation.label)⟧；请按 cite_passage 返回的编号提交。")
-                    }
-                    normalized.append(MessageCitation(contextID: citation.contextID, label: expectedLabel, pageLabel: row.context.pageLabel))
+                guard let row = numbered[citation.contextID] else {
+                    citationWarnings.append("有一处提交的原文不属于本轮阅读快照，对应标记将保留为普通文字。")
+                    continue
                 }
-                let citationLabels = Set(normalized.map(\.label))
-                guard !markerLabels.isEmpty, markerLabels == citationLabels else {
-                    throw PaperDeskError.conflict("回答中的出处编号必须与 citations 完全对应；请检查 ⟦n⟧ 标记和提交的出处列表。")
+                let expectedLabel = String(row.number)
+                submittedLabelMappings[citation.label, default: []].insert(expectedLabel)
+                if citation.label != expectedLabel {
+                    citationWarnings.append("原文编号 \(citation.label) 与阅读器返回的编号不一致，已按阅读器记录校正。")
                 }
-                citations = normalized.sorted { (Int($0.label) ?? .max) < (Int($1.label) ?? .max) }
+                normalized.append(MessageCitation(contextID: citation.contextID, label: expectedLabel,
+                                                  pageLabel: row.context.pageLabel))
             }
-            let previous = pendingQuestion == nil ? try optional("previous_discussion_id", arguments) : nil
-            let archived = try model.store.appendDiscussion(paperID: paper.id, snapshotID: snapshotID, question: question, answer: answer, sourceContextIDs: sourceIDs, idempotencyKey: key, citations: citations,
+            let correctedLabels = submittedLabelMappings.compactMapValues { values in
+                values.count == 1 ? values.first : nil
+            }
+            if !correctedLabels.isEmpty {
+                answer = renumberCitationMarkers(in: answer, using: correctedLabels)
+                markerLabels = citationLabels(in: answer)
+            }
+            let validLabels = Set(normalized.map(\.label))
+            let missingLabels = markerLabels.subtracting(validLabels)
+            let unusedLabels = validLabels.subtracting(markerLabels)
+            if !missingLabels.isEmpty {
+                let labels = missingLabels.sorted { (Int($0) ?? .max) < (Int($1) ?? .max) }
+                    .map { "⟦\($0)⟧" }.joined(separator: ", ")
+                citationWarnings.append("这些原文标记没有找到对应位置，已保留为普通文字：\(labels)。")
+            }
+            if !unusedLabels.isEmpty {
+                citationWarnings.append("有原文位置未在回答正文标出，已省略未使用的定位。")
+            }
+            normalized = normalized.filter { markerLabels.contains($0.label) }
+            let occurrenceOrder = citationLabelOrder(in: answer)
+            if Set(occurrenceOrder) == Set(normalized.map(\.label)), !occurrenceOrder.isEmpty {
+                let renumbered = Dictionary(uniqueKeysWithValues: occurrenceOrder.enumerated().map {
+                    ($0.element, String($0.offset + 1))
+                })
+                if renumbered.contains(where: { $0.key != $0.value }) {
+                    answer = renumberCitationMarkers(in: answer, using: renumbered)
+                    normalized = normalized.map {
+                        MessageCitation(contextID: $0.contextID, label: renumbered[$0.label] ?? $0.label,
+                                        pageLabel: $0.pageLabel)
+                    }
+                    citationWarnings.append("原文编号已按正文首次出现顺序整理，请再核对每个标记是否贴近正确说法。")
+                }
+            }
+            citations = normalized.sorted { (Int($0.label) ?? .max) < (Int($1.label) ?? .max) }
+            let optedOut = referenceRenderingOptedOut(question) || arguments["render_references"].boolValue == false
+            let rendered = renderReferences(in: answer, question: question, snapshot: snapshot, paper: paper,
+                                            citations: citations, enabled: !optedOut)
+            citations = rendered.citations
+            citationWarnings.append(contentsOf: rendered.warnings)
+            let references = try model.store.references(paperID: paper.id)
+            let referencedWorks = optedOut ? [] : PaperReferenceMentions.snapshots(in: rendered.text, references: references)
+            let unresolvedLabels = optedOut ? [] : PaperReferenceMentions.unresolvedLabels(in: rendered.text, references: references)
+            if !unresolvedLabels.isEmpty {
+                citationWarnings.append("参考文献编号 \(unresolvedLabels.map { "[\($0)]" }.joined(separator: ", ")) 未能唯一对应到已识别的目录条目，请核对。")
+            }
+            let isLongAnswer = answer.count > 900 || answer.components(separatedBy: "\n\n").count >= 3
+            if model.allowsAICitationMarks, !optedOut, citations.isEmpty, isLongAnswer {
+                citationWarnings.append("这是一段较长的答复，但没有可跳回 PDF 的原文标记，请检查是否漏标。")
+            }
+            let cleanedWarnings = citationWarnings.map {
+                String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
+            }.filter { !$0.isEmpty }
+            var uniqueWarnings: [String] = []
+            for warning in cleanedWarnings where !uniqueWarnings.contains(warning) {
+                uniqueWarnings.append(warning)
+            }
+            citationWarnings = Array(uniqueWarnings.prefix(20))
+            let feedback = try discussionFeedback(arguments["feedback"])
+            let mode: ReadingAnswerMode?
+            if let rawMode = try optional("answer_mode", arguments) {
+                guard let parsedMode = ReadingAnswerMode(rawValue: rawMode) else {
+                    throw PaperDeskError.invalid("answer_mode 无效")
+                }
+                mode = parsedMode
+            } else {
+                mode = nil
+            }
+            let previous = if let pendingQuestion {
+                feedback == nil ? nil : pendingQuestion.previousAnswerID
+            } else {
+                try optional("previous_discussion_id", arguments)
+            }
+            guard feedback == nil || previous != nil else {
+                throw PaperDeskError.invalid("记录反馈时需要同一对话的上一条已归档回答")
+            }
+            let archived = try model.store.appendDiscussion(paperID: paper.id, snapshotID: snapshotID, question: question, answer: rendered.text, sourceContextIDs: sourceIDs, idempotencyKey: key, citations: citations,
                                                             origin: clientOrigin, manuallyRecorded: false, sharedWithAI: true,
                                                             conversationID: pendingQuestion?.conversationID ?? clientConversationID,
-                                                            continuingFrom: previous)
+                                                            continuingFrom: previous, feedbackKind: feedback?.kind,
+                                                            feedbackEvidence: feedback?.evidence,
+                                                            referencedWorks: referencedWorks,
+                                                            citationWarnings: citationWarnings,
+                                                            answerMode: mode)
             if let pendingQuestion { model.questions.recordArchive(requestID: pendingQuestion.id, messageID: archived.id) }
             if model.selectedPaper?.id == paper.id { model.refreshDiscussion() }
             return try result(.object(["saved": .bool(true), "message_id": .string(archived.id), "paper_id": .string(paper.id),
                                        "snapshot_id": .string(snapshotID), "source_context_ids": .array(sourceIDs.map(JSONValue.string)),
                                        "citation_context_ids": .array(citations.map { .string($0.contextID) }),
+                                       "rendered_answer": rendered.text == submittedAnswer ? .null : .string(rendered.text),
+                                       "citation_warnings": .array(citationWarnings.map(JSONValue.string)),
                                        "conversation_id": archived.conversationID.map(JSONValue.string) ?? .null,
                                        "origin": originObject(archived.origin)]))
         case "set_reading_goal":
@@ -820,6 +1031,9 @@ final class ReaderTools {
             detail["question_truncated"] = .bool(question.next != .null)
             detail["answer_truncated"] = .bool(answer.next != .null)
             return try result(.object(detail))
+        case "reading_feedback_summary":
+            let paper = try resolveCurrentPaper(id: arguments["paper_id"].stringValue)
+            return try result(try readingFeedbackSummary(for: paper))
         case "search_notes":
             let paper = try resolveCurrentPaper(id: arguments["paper_id"].stringValue)
             let query = String(arguments["query"].stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2_000) ?? "")
@@ -1015,7 +1229,12 @@ final class ReaderTools {
     /// Only prose can display links. Formula delimiters and nonnumeric double
     /// brackets may be part of the author's notation.
     private func citationLabels(in answer: String) -> Set<String> {
-        var labels = Set<String>()
+        Set(citationLabelOrder(in: answer))
+    }
+
+    private func citationLabelOrder(in answer: String) -> [String] {
+        var labels: [String] = []
+        var seen = Set<String>()
         for block in LatexDocument.blocks(answer) {
             guard case .inline(let parts) = block else { continue }
             for part in parts {
@@ -1023,8 +1242,8 @@ final class ReaderTools {
                 var rest = text[...]
                 while let open = rest.firstIndex(of: "⟦"), let close = rest[open...].firstIndex(of: "⟧") {
                     let label = rest[rest.index(after: open)..<close].trimmingCharacters(in: .whitespaces)
-                    if !label.isEmpty, label.utf8.allSatisfy({ (48...57).contains($0) }) {
-                        labels.insert(label)
+                    if !label.isEmpty, label.utf8.allSatisfy({ (48...57).contains($0) }), seen.insert(label).inserted {
+                        labels.append(label)
                     }
                     rest = rest[rest.index(after: close)...]
                 }
@@ -1033,22 +1252,221 @@ final class ReaderTools {
         return labels
     }
 
+    private func renumberCitationMarkers(in answer: String, using labels: [String: String]) -> String {
+        guard let expression = try? NSRegularExpression(pattern: #"⟦\s*(\d+)\s*⟧"#) else { return answer }
+        let ns = answer as NSString
+        let output = NSMutableString(string: answer)
+        let matches = expression.matches(in: answer, range: NSRange(location: 0, length: ns.length))
+        for match in matches.reversed() {
+            guard match.numberOfRanges > 1 else { continue }
+            let oldLabel = ns.substring(with: match.range(at: 1))
+            guard let newLabel = labels[oldLabel], oldLabel != newLabel else { continue }
+            output.replaceCharacters(in: match.range, with: "⟦\(newLabel)⟧")
+        }
+        return output as String
+    }
+
     /// An external client may finish successfully without calling save_discussion.
-    /// Preserve its reply and any numbered sources actually created for this turn.
+    /// Preserve its reply and any numbered sources actually created for this
+    /// turn. Apply the same verified reference rendering as save_discussion.
     func archiveQuestionFallback(_ request: PendingPaperQuestion, answer: String) throws {
         let labels = citationLabels(in: answer)
         let rows = try model.store.snapshotCitations(snapshotID: request.snapshot.id)
         let citations = rows.filter { labels.contains(String($0.number)) }.map {
             MessageCitation(contextID: $0.context.id, label: String($0.number), pageLabel: $0.context.pageLabel)
         }
-        guard citations.count == labels.count else {
+        guard Set(citations.map(\.label)) == labels else {
             throw PaperDeskError.conflict("回答中的出处缺少对应位置，草稿已保留。")
         }
+        let paper = try model.store.paper(id: request.paperID)
+        let rendered = renderReferences(in: answer, question: request.question, snapshot: request.snapshot,
+                                        paper: paper, citations: citations)
+        let references = try model.store.references(paperID: paper.id)
+        let optedOut = referenceRenderingOptedOut(request.question)
+        var warnings = rendered.warnings
+        let unresolvedLabels = optedOut ? [] : PaperReferenceMentions.unresolvedLabels(in: rendered.text, references: references)
+        if !unresolvedLabels.isEmpty {
+            warnings.append("参考文献编号 \(unresolvedLabels.map { "[\($0)]" }.joined(separator: ", ")) 未能唯一对应到已识别的目录条目，请核对。")
+        }
+        let isLongAnswer = answer.count > 900 || answer.components(separatedBy: "\n\n").count >= 3
+        if model.allowsAICitationMarks, !optedOut, rendered.citations.isEmpty, isLongAnswer {
+            warnings.append("这是一段较长的答复，但没有可跳回 PDF 的原文标记，请检查是否漏标。")
+        }
         _ = try model.store.appendDiscussion(paperID: request.paperID, snapshotID: request.snapshot.id,
-                                             question: request.question, answer: answer, sourceContextIDs: [],
-                                             idempotencyKey: request.archiveKey, citations: citations,
+                                             question: request.question, answer: rendered.text, sourceContextIDs: [],
+                                             idempotencyKey: request.archiveKey, citations: rendered.citations,
                                              origin: RecordOrigin(clientName: request.displayName), sharedWithAI: true,
-                                             conversationID: request.conversationID)
+                                             conversationID: request.conversationID,
+                                             referencedWorks: optedOut ? [] : PaperReferenceMentions.snapshots(in: rendered.text, references: references),
+                                             citationWarnings: Array(warnings.prefix(20)))
+    }
+
+    /// A deterministic fallback for a harness that emits a literal quotation
+    /// but skips its reference pass. Preserve the answer's actual wording.
+    private func renderReferences(in answer: String, question: String, snapshot: ReadingQuestionSnapshot,
+                                  paper: Paper, citations: [MessageCitation], enabled: Bool = true)
+        -> (text: String, citations: [MessageCitation], warnings: [String]) {
+        guard enabled, !referenceRenderingOptedOut(question) else { return (answer, citations, []) }
+
+        let pattern = #"“([^”\n]{12,400})”|「([^」\n]{12,400})」|"([^"\n]{12,400})"|\b10\.\d{4,9}/[A-Z0-9._/-]*[A-Z0-9]"#
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return (answer, citations, [])
+        }
+        var output = answer
+        var resolved = citations
+        var warnings: [String] = []
+        var edits: [(Range<String.Index>, String)] = []
+        var inspected = 0
+        var fenced = false
+        let scope = model.scope(forPaperID: paper.id)
+        var document: PDFDocument?
+        var pageTexts: [Int: String] = [:]
+        for line in answer.split(separator: "\n", omittingEmptySubsequences: false) {
+            if inspected == 32 {
+                warnings.append("自動核對已達 32 处上限，请再检查其余原文引文。")
+                break
+            }
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") ||
+                line.trimmingCharacters(in: .whitespaces).hasPrefix("~~~") {
+                fenced.toggle()
+                continue
+            }
+            guard !fenced,
+                  !line.hasPrefix("    "), !line.hasPrefix("\t") else { continue }
+            let text = String(line)
+            let matches = expression.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            let protectedRanges = referenceBackfillProtectedRanges(in: text)
+            for match in matches.prefix(32) {
+                guard inspected < 32, let range = Range(match.range, in: line) else { break }
+                inspected += 1
+                guard !protectedRanges.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else { continue }
+                let quoteRange = (1...3).compactMap { Range(match.range(at: $0), in: line) }.first
+                guard let quoteRange else {
+                    let preceding = line[..<range.lowerBound]
+                    let token = preceding.split(whereSeparator: \.isWhitespace).last ?? ""
+                    let trailing = line[range.upperBound...]
+                    guard !token.contains("://"), !token.contains("/"),
+                          trailing.first.map({ !"()[]:/".contains($0) }) ?? true else { continue }
+                    let doi = String(line[range])
+                    edits.append((range, "[\(doi)](https://doi.org/\(doi))"))
+                    continue
+                }
+                guard !line[range.upperBound...].trimmingCharacters(in: .whitespaces).hasPrefix("⟦") else { continue }
+                guard model.allowsAICitationMarks else {
+                    warnings.append("检测到带引号的原文，但当前权限无法建立 PDF 跳转标记。")
+                    continue
+                }
+                guard resolved.count < 32 else {
+                    warnings.append("原文标记已达到 32 处上限，仍有带引号的句子未定位。")
+                    continue
+                }
+                guard paper.fileHash == snapshot.state.documentHash else {
+                    warnings.append("PDF 版本已变化，无法确认带引号原文的位置。")
+                    continue
+                }
+                let quote = String(line[quoteRange])
+                var arguments: [String: JSONValue] = ["snapshot_id": .string(snapshot.id)]
+                let choices = snapshot.state.selections.filter { $0.context.sourceText == quote }
+                if choices.count == 1, let selection = choices.first {
+                    arguments["selection_context_id"] = .string(selection.id)
+                } else {
+                    guard scope == .page || (scope == .document && paper.pageCount <= 250) else {
+                        warnings.append("一处带引号原文超出当前共享范围，未添加跳转标记。")
+                        continue
+                    }
+                    if document == nil { document = try? pdfDocument(for: paper) }
+                    guard let document else {
+                        warnings.append("无法读取 PDF 来定位一处带引号原文。")
+                        continue
+                    }
+                    let indices = scope == .page ? [snapshot.state.pageIndex] : Array(0..<document.pageCount)
+                    var matchingPage: Int?
+                    for index in indices {
+                        if pageTexts[index] == nil { pageTexts[index] = document.page(at: index)?.string ?? "" }
+                        guard pageTexts[index]?.range(of: quote, options: .literal) != nil else { continue }
+                        if matchingPage != nil { matchingPage = nil; break }
+                        matchingPage = index
+                    }
+                    guard let matchingPage else {
+                        warnings.append("一处带引号原文未能在共享页面中唯一定位。")
+                        continue
+                    }
+                    arguments["page_index"] = .number(Double(matchingPage))
+                    arguments["quote"] = .string(quote)
+                }
+                guard let result = try? citePassage(.object(arguments))["structuredContent"],
+                      let id = result["citation_id"].stringValue, let label = result["label"].stringValue else {
+                    warnings.append("一处带引号原文未能建立 PDF 跳转标记，请核对页码。")
+                    continue
+                }
+                if !resolved.contains(where: { $0.contextID == id }) {
+                    resolved.append(MessageCitation(contextID: id, label: label, pageLabel: result["page_label"].stringValue))
+                }
+                edits.append((range.upperBound..<range.upperBound, "⟦\(label)⟧"))
+            }
+        }
+        for (range, replacement) in edits.reversed() { output.replaceSubrange(range, with: replacement) }
+        return (output, resolved.sorted { (Int($0.label) ?? .max) < (Int($1.label) ?? .max) }, warnings)
+    }
+
+    private func referenceRenderingOptedOut(_ question: String) -> Bool {
+        let request = question.lowercased()
+        let optOut = ["不加引用", "不添加引用", "不要引用", "不需要引用", "不要标", "不做标注", "不需要标注",
+                      "no citations", "without citations", "do not cite", "no highlights", "don't cite"]
+        return optOut.contains(where: { request.contains($0) })
+    }
+
+    private func referenceBackfillProtectedRanges(in text: String) -> [NSRange] {
+        let ns = text as NSString
+        let fullRange = NSRange(location: 0, length: ns.length)
+        let patterns = [#"`+[^`]*`+"#, #"(?<!\\)\$[^$\n]+\$"#, #"\\\([^\n]*?\\\)"#,
+                        #"\[[^\]\n]+\]\([^)]+\)"#]
+        return patterns.flatMap { pattern in
+            (try? NSRegularExpression(pattern: pattern))?.matches(in: text, range: fullRange).map(\.range) ?? []
+        }
+    }
+
+    private func discussionFeedback(_ value: JSONValue) throws -> (kind: ReadingFeedbackKind, evidence: String)? {
+        guard value != .null else { return nil }
+        guard let fields = value.objectValue, fields.count == 2,
+              let rawKind = fields["kind"]?.stringValue, let kind = ReadingFeedbackKind(rawValue: rawKind) else {
+            throw PaperDeskError.invalid("feedback 必须包含有效的 kind 和 evidence")
+        }
+        return (kind, try required("evidence", value, maximum: 240))
+    }
+
+    private func optionalReferenceText(_ value: JSONValue?) -> String? {
+        guard let raw = value?.stringValue else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.count > 2_000 || trimmed == "null" { return nil }
+        return trimmed
+    }
+
+    private func referenceObject(_ reference: PaperReference, rawLimit: Int) -> JSONValue {
+        let raw = String(reference.rawText.prefix(rawLimit))
+        return .object([
+            "reference_id": .string(reference.id),
+            "paper_id": .string(reference.paperID),
+            "label": .string(reference.displayLabel),
+            "entry_index": .number(Double(reference.entryIndex)),
+            "authors": reference.authors.map(JSONValue.string) ?? .null,
+            "first_author": reference.firstAuthor.map(JSONValue.string) ?? .null,
+            "title": reference.title.map(JSONValue.string) ?? .null,
+            "year": reference.year.map { .number(Double($0)) } ?? .null,
+            "venue": reference.venue.map(JSONValue.string) ?? .null,
+            "doi": reference.doi.map(JSONValue.string) ?? .null,
+            "arxiv_id": reference.arxivID.map(JSONValue.string) ?? .null,
+            "url": reference.url.map(JSONValue.string) ?? .null,
+            "status": .string(reference.status.rawValue),
+            "source": .string(reference.source.rawValue),
+            "page_index": .number(Double(reference.pageIndex)),
+            "page_label": .string(reference.pageLabel),
+            "verified_at": reference.verifiedAt.map { .string(ISO8601DateFormatter().string(from: $0)) } ?? .null,
+            "verified_by": reference.verifiedBy.map(JSONValue.string) ?? .null,
+            "evidence_url": reference.evidenceURL.map(JSONValue.string) ?? .null,
+            "raw_text": .string(raw),
+            "raw_truncated": .bool(raw.count < reference.rawText.count)
+        ])
     }
 
     private func citationArray(_ value: JSONValue?, maximum: Int) throws -> [MessageCitation] {
@@ -1069,6 +1487,25 @@ final class ReaderTools {
             throw PaperDeskError.invalid("citations 不能重复提交同一处原文")
         }
         return citations
+    }
+
+    private func citationWarningArray(_ value: JSONValue?) throws -> [String] {
+        guard let value, value != .null else { return [] }
+        guard let values = value.arrayValue, values.count <= 20 else {
+            throw PaperDeskError.invalid("citation_warnings 参数无效或超过 20 条")
+        }
+        var warnings: [String] = []
+        for item in values {
+            guard let text = item.stringValue else {
+                throw PaperDeskError.invalid("citation_warnings 中的每项都必须是文字")
+            }
+            let warning = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !warning.isEmpty, warning.count <= 500 else {
+                throw PaperDeskError.invalid("每条 citation_warnings 必须为 1 到 500 个字符")
+            }
+            if !warnings.contains(warning) { warnings.append(warning) }
+        }
+        return warnings
     }
 
     private func stringArray(_ key: String, _ arguments: JSONValue, maximum: Int, required: Bool = true) throws -> [String] {
@@ -1094,6 +1531,37 @@ final class ReaderTools {
         return document
     }
 
+    private func connectionPolicy(for paper: Paper?) -> [String: JSONValue] {
+        let scope = paper.map { model.scope(forPaperID: $0.id) }
+        let mode: String
+        if model.allowsAICitationMarks {
+            switch scope {
+            case .selection: mode = "selected_passages"
+            case .page: mode = "current_page"
+            case .document: mode = "document"
+            case nil: mode = "unavailable"
+            }
+        } else {
+            mode = "disabled"
+        }
+        return [
+            "connected": .bool(true),
+            "paper_id": paper.map { .string($0.id) } ?? .null,
+            "document_hash": paper.map { .string($0.fileHash) } ?? .null,
+            "scope": scope.map { .string($0.rawValue) } ?? .null,
+            "citation_marks_enabled": .bool(model.allowsAICitationMarks),
+            "citation_mode": .string(mode)
+        ]
+    }
+
+    private func citationPolicyError(_ code: String, _ message: String) -> JSONValue {
+        .object([
+            "content": .array([.object(["type": .string("text"), "text": .string(message)])]),
+            "structuredContent": .object(["code": .string(code), "message": .string(message)]),
+            "isError": .bool(true)
+        ])
+    }
+
     private func citePassage(_ arguments: JSONValue) throws -> JSONValue {
         let snapshotID = try required("snapshot_id", arguments, maximum: 512)
         guard let snapshot = try model.store.readingSnapshot(id: snapshotID) else {
@@ -1105,16 +1573,36 @@ final class ReaderTools {
         guard snapshot.state.documentHash == paper.fileHash else {
             throw PaperDeskError.conflict("这份阅读状态对应的 PDF 版本已经变化")
         }
-        guard let pageIndex = arguments["page_index"].intValue, (0..<paper.pageCount).contains(pageIndex) else {
-            throw PaperDeskError.invalid("引用所在的 PDF 页码无效。")
-        }
+        let selectionID = try optional("selection_context_id", arguments, maximum: 512)
         let quote = try optional("quote", arguments, maximum: 1_200)
         let hasRegion = arguments["region"] != .null
+        if let selectionID {
+            guard quote == nil, !hasRegion, arguments["page_index"] == .null else {
+                throw PaperDeskError.invalid(L("按选区标注时，只需提供选区编号。", "When citing a selection, provide its context ID as the only location."))
+            }
+            guard let selection = snapshot.state.selections.first(where: { $0.id == selectionID }) else {
+                throw PaperDeskError.conflict(L("请选择这次阅读状态里的原文选区。", "Use a selection from this reading snapshot."))
+            }
+            return try registerCitation(selection.context, snapshotID: snapshotID, paper: paper, reuseContext: true)
+        }
         guard (quote != nil) != hasRegion else {
             throw PaperDeskError.invalid("原句和矩形坐标只能指定一种。")
         }
-        try checkPageScope(paper: paper, indices: [pageIndex])
-        let existing = try model.store.snapshotCitations(snapshotID: snapshotID)
+        guard let pageIndex = arguments["page_index"].intValue, (0..<paper.pageCount).contains(pageIndex) else {
+            throw PaperDeskError.invalid("引用所在的 PDF 页码无效。")
+        }
+        if model.scope(forPaperID: paper.id) == .selection {
+            let matches = snapshot.state.selections.filter {
+                $0.context.pageIndex == pageIndex && $0.context.sourceText == quote
+            }
+            guard let quote, !quote.isEmpty, matches.count == 1, let selection = matches.first else {
+                return citationPolicyError("selection_required",
+                    L("当前只共享已选的原文。请用这次阅读状态的选区编号标注。",
+                      "Only selected passages are shared. Cite a selection from this snapshot by its context ID."))
+            }
+            return try registerCitation(selection.context, snapshotID: snapshotID, paper: paper, reuseContext: true)
+        }
+        try checkPageScope(paper: paper, indices: [pageIndex], snapshotPage: snapshot.state.pageIndex)
         let document = try pdfDocument(for: paper)
         guard let page = document.page(at: pageIndex) else { throw PaperDeskError.missing("找不到引用所在的 PDF 页。") }
 
@@ -1131,7 +1619,17 @@ final class ReaderTools {
                                      pageLabel: page.label ?? String(pageIndex + 1), text: text, regions: [region])
             image = try PDFRegionRenderer.render(page: page, bounds: rect)
         }
+        return try registerCitation(target, snapshotID: snapshotID, paper: paper, image: image)
+    }
 
+    private func registerCitation(_ target: ContextSnapshot, snapshotID: String, paper: Paper,
+                                  image: Data? = nil, reuseContext: Bool = false) throws -> JSONValue {
+        guard target.paperID == paper.id, target.documentHash == paper.fileHash,
+              (0..<paper.pageCount).contains(target.pageIndex), !target.regions.isEmpty,
+              target.regions.allSatisfy({ $0.pageIndex == target.pageIndex }) else {
+            throw PaperDeskError.conflict(L("这处引用没有对应当前 PDF 的有效位置。", "The citation has no valid location in the current PDF."))
+        }
+        let existing = try model.store.snapshotCitations(snapshotID: snapshotID)
         // Retrying the same passage reuses its footnote instead of consuming
         // the next number.
         if let duplicate = existing.first(where: {
@@ -1141,11 +1639,11 @@ final class ReaderTools {
         }) {
             return try result(citationObject(duplicate, paper: paper))
         }
-        guard existing.count < 8 else {
-            throw PaperDeskError.invalid("每条回答最多引用 8 处原文")
+        guard existing.count < 32 else {
+            throw PaperDeskError.invalid("每条回答最多引用 32 处原文")
         }
-        let saved = try model.store.saveContext(target, imageData: image)
-        let citation = try model.store.addSnapshotCitation(snapshotID: snapshotID, contextID: saved.id, maximum: 8)
+        let saved = reuseContext ? target : try model.store.saveContext(target, imageData: image)
+        let citation = try model.store.addSnapshotCitation(snapshotID: snapshotID, contextID: saved.id, maximum: 32)
         return try result(citationObject(citation, paper: paper))
     }
 
@@ -1213,12 +1711,12 @@ final class ReaderTools {
         return ExtractiveCoverage(textPageIndices: textPages, unavailablePageIndices: unavailable)
     }
 
-    private func checkPageScope(paper: Paper, indices: [Int]) throws {
+    private func checkPageScope(paper: Paper, indices: [Int], snapshotPage: Int? = nil) throws {
         switch model.scope(forPaperID: paper.id) {
         case .selection:
             throw PaperDeskError.invalid("当前范围为“仅选区”，请使用阅读状态快照或固定选区")
         case .page:
-            let pageIndex = try pendingQuestion?.snapshot.state.pageIndex ?? model.store.readingState(paperID: paper.id).pageIndex
+            let pageIndex = try snapshotPage ?? pendingQuestion?.snapshot.state.pageIndex ?? model.store.readingState(paperID: paper.id).pageIndex
             guard indices.allSatisfy({ $0 == pageIndex }) else { throw PaperDeskError.invalid("当前范围为“当前页”，只能读取当前页") }
         case .document:
             break

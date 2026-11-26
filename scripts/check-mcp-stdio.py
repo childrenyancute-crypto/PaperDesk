@@ -69,7 +69,9 @@ def main() -> None:
             send(process, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
             tools = read_line(process)
             assert tools.get("id") == 2, tools
-            assert tools.get("result", {}).get("tools"), tools
+            catalog = {tool["name"]: tool for tool in tools["result"]["tools"]}
+            assert catalog["paperdesk_connection_status"]["annotations"]["readOnlyHint"]
+            assert "selection_context_id" in catalog["cite_passage"]["inputSchema"]["properties"]
         finally:
             if process.stdin is not None:
                 process.stdin.close()
